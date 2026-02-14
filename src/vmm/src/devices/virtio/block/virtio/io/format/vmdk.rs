@@ -1,0 +1,144 @@
+// Copyright (c) 2026 Tencent. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+use std::fs::File;
+use std::io;
+
+use imago::FormatDriverBuilder;
+use imago::file::File as ImagoFile;
+use imago::format::access::FormatAccess;
+use imago::format::gate::PermissiveImplicitOpenGate;
+use imago::io_buffers::IoVectorMut;
+use imago::vmdk::Vmdk;
+use vm_memory::{GuestMemoryBackend, GuestMemoryError};
+
+use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
+
+/// Errors specific to the VMDK IO engine.
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum VmdkIoError {
+    /// Failed to open VMDK image: {0}
+    Open(io::Error),
+    /// VMDK read error: {0}
+    Read(io::Error),
+    /// VMDK write not supported (read-only image)
+    WriteNotSupported,
+    /// VMDK backend requires is_read_only=true.
+    RequiresReadOnly,
+    /// Guest memory error: {0}
+    GuestMemory(GuestMemoryError),
+    /// VMDK flush error: {0}
+    Flush(io::Error),
+}
+
+#[derive(Debug)]
+pub struct VmdkFileEngine {
+    access: FormatAccess<ImagoFile>,
+}
+
+impl VmdkFileEngine {
+    pub fn from_file(file: File) -> Result<Self, VmdkIoError> {
+        let imago_file: ImagoFile = file.try_into().map_err(VmdkIoError::Open)?;
+
+        let vmdk = Vmdk::<ImagoFile>::builder(imago_file)
+            .write(false)
+            .open(PermissiveImplicitOpenGate::default())
+            .map_err(VmdkIoError::Open)?;
+
+        Ok(Self {
+            access: FormatAccess::new(vmdk),
+        })
+    }
+
+    pub fn disk_size(&self) -> u64 {
+        self.access.size()
+    }
+
+    pub fn read(
+        &self,
+        offset: u64,
+        mem: &GuestMemoryMmap,
+        addr: GuestAddress,
+        count: u32,
+    ) -> Result<u32, VmdkIoError> {
+        let slice = mem
+            .get_slice(addr, count as usize)
+            .map_err(VmdkIoError::GuestMemory)?;
+        let slices = [slice];
+        let (bufv, _guard) = IoVectorMut::from_volatile_slice(&slices);
+        self.access.readv(bufv, offset).map_err(VmdkIoError::Read)?;
+
+        Ok(count)
+    }
+
+    pub fn write(
+        &self,
+        _offset: u64,
+        _mem: &GuestMemoryMmap,
+        _addr: GuestAddress,
+        _count: u32,
+    ) -> Result<u32, VmdkIoError> {
+        Err(VmdkIoError::WriteNotSupported)
+    }
+
+    pub fn flush(&self) -> Result<(), VmdkIoError> {
+        self.access.flush().map_err(VmdkIoError::Flush)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use vmm_sys_util::tempfile::TempFile;
+
+    use super::*;
+
+    fn create_test_vmdk() -> (TempFile, TempFile) {
+        let extent_file = TempFile::new().unwrap();
+        let extent_size: u64 = 1024 * 1024;
+        extent_file.as_file().set_len(extent_size).unwrap();
+
+        let test_data = b"Hello VMDK from Firecracker!";
+        extent_file.as_file().write_all(test_data).unwrap();
+
+        let extent_path = extent_file.as_path().to_str().unwrap().to_string();
+        let extent_sectors = extent_size / 512;
+
+        let descriptor_file = TempFile::new().unwrap();
+        let descriptor_content = format!(
+            r#"# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType="monolithicFlat"
+
+# Extent description
+RW {extent_sectors} FLAT "{extent_path}" 0
+
+# The Disk Data Base
+#DDB
+"#
+        );
+        descriptor_file
+            .as_file()
+            .write_all(descriptor_content.as_bytes())
+            .unwrap();
+
+        (descriptor_file, extent_file)
+    }
+
+    #[test]
+    fn test_vmdk_engine_open_and_read() {
+        let (descriptor, _extent) = create_test_vmdk();
+
+        let file = std::fs::File::open(descriptor.as_path()).unwrap();
+        let engine = VmdkFileEngine::from_file(file).unwrap();
+
+        assert_eq!(engine.disk_size(), 1024 * 1024);
+
+        let mut buf = vec![0u8; 512];
+        engine.access.read(&mut buf[..], 0).unwrap();
+        assert_eq!(&buf[..28], b"Hello VMDK from Firecracker!");
+    }
+}
