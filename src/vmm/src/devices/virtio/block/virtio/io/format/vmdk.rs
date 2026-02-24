@@ -18,50 +18,6 @@ use vm_memory::GuestMemoryError;
 
 use crate::vstate::memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
-/// VMDK4 sparse file magic: 'KDMV' in little-endian.
-const VMDK4_MAGIC: u32 = 0x564d_444b;
-
-/// The detected disk image format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiskImageFormat {
-    /// Raw disk image (no format header detected).
-    Raw,
-    /// VMDK disk image.
-    Vmdk,
-}
-
-/// Detects the format of a disk image by reading its first bytes.
-///
-/// Returns `DiskImageFormat::Vmdk` if the file appears to be a VMDK descriptor or sparse file,
-/// otherwise returns `DiskImageFormat::Raw`.
-pub fn detect_disk_format(file: &File) -> io::Result<DiskImageFormat> {
-    use std::os::unix::fs::FileExt;
-
-    // Read the first 512 bytes to check for VMDK signatures.
-    let mut header = [0u8; 512];
-    let bytes_read = file.read_at(&mut header, 0)?;
-    if bytes_read < 4 {
-        return Ok(DiskImageFormat::Raw);
-    }
-
-    // Check for VMDK4 sparse magic (binary VMDK).
-    let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-    if magic == VMDK4_MAGIC {
-        return Ok(DiskImageFormat::Vmdk);
-    }
-
-    // Check for VMDK descriptor file (text-based).
-    if let Ok(text) = std::str::from_utf8(&header[..bytes_read]) {
-        if text.contains("# Disk DescriptorFile")
-            || (text.contains("version") && text.contains("createType"))
-        {
-            return Ok(DiskImageFormat::Vmdk);
-        }
-    }
-
-    Ok(DiskImageFormat::Raw)
-}
-
 /// Errors specific to the VMDK IO engine.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum VmdkIoError {
@@ -174,6 +130,7 @@ mod tests {
 
     use vmm_sys_util::tempfile::TempFile;
 
+    use super::super::{DiskImageFormat, VMDK4_MAGIC, detect_disk_format};
     use super::*;
 
     /// Create a minimal VMDK descriptor file that references a flat extent.

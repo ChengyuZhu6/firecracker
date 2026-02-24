@@ -2,15 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod async_io;
+pub mod format;
 pub mod sync_io;
-pub mod vmdk_io;
 
 use std::fmt::Debug;
 use std::fs::File;
 
 pub use self::async_io::{AsyncFileEngine, AsyncIoError};
+pub use self::format::{DiskImageFormat, VmdkFileEngine, VmdkIoError, detect_disk_format};
 pub use self::sync_io::{SyncFileEngine, SyncIoError};
-pub use self::vmdk_io::{DiskImageFormat, VmdkFileEngine, VmdkIoError, detect_disk_format};
 use crate::devices::virtio::block::virtio::PendingRequest;
 use crate::devices::virtio::block::virtio::device::FileEngineType;
 use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
