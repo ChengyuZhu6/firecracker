@@ -4,7 +4,7 @@
 pub mod vmdk;
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 
 pub use self::vmdk::{VmdkFileEngine, VmdkIoError};
 
@@ -21,11 +21,10 @@ pub enum DiskImageFormat {
 }
 
 /// Detects the format of a disk image by reading its first bytes.
-pub fn detect_disk_format(file: &File) -> io::Result<DiskImageFormat> {
-    use std::os::unix::fs::FileExt;
-
+pub fn detect_disk_format(file: &mut File) -> io::Result<DiskImageFormat> {
     let mut header = [0u8; 512];
-    let bytes_read = file.read_at(&mut header, 0)?;
+    file.seek(SeekFrom::Start(0))?;
+    let bytes_read = file.read(&mut header)?;
     if bytes_read < 4 {
         return Ok(DiskImageFormat::Raw);
     }
@@ -56,13 +55,13 @@ mod tests {
     #[test]
     fn test_detect_raw_format() {
         let empty = TempFile::new().unwrap();
-        let file = File::open(empty.as_path()).unwrap();
-        assert_eq!(detect_disk_format(&file).unwrap(), DiskImageFormat::Raw);
+        let mut file = File::open(empty.as_path()).unwrap();
+        assert_eq!(detect_disk_format(&mut file).unwrap(), DiskImageFormat::Raw);
 
         let non_empty = TempFile::new().unwrap();
         non_empty.as_file().set_len(4096).unwrap();
-        let file = File::open(non_empty.as_path()).unwrap();
-        assert_eq!(detect_disk_format(&file).unwrap(), DiskImageFormat::Raw);
+        let mut file = File::open(non_empty.as_path()).unwrap();
+        assert_eq!(detect_disk_format(&mut file).unwrap(), DiskImageFormat::Raw);
     }
 
     #[test]
@@ -72,16 +71,22 @@ mod tests {
             .as_file()
             .write_all(b"# Disk DescriptorFile\nversion=1\n")
             .unwrap();
-        let file = File::open(descriptor.as_path()).unwrap();
-        assert_eq!(detect_disk_format(&file).unwrap(), DiskImageFormat::Vmdk);
+        let mut file = File::open(descriptor.as_path()).unwrap();
+        assert_eq!(
+            detect_disk_format(&mut file).unwrap(),
+            DiskImageFormat::Vmdk
+        );
 
         let createtype = TempFile::new().unwrap();
         createtype
             .as_file()
             .write_all(b"version=1\ncreateType=\"monolithicFlat\"\n")
             .unwrap();
-        let file = File::open(createtype.as_path()).unwrap();
-        assert_eq!(detect_disk_format(&file).unwrap(), DiskImageFormat::Vmdk);
+        let mut file = File::open(createtype.as_path()).unwrap();
+        assert_eq!(
+            detect_disk_format(&mut file).unwrap(),
+            DiskImageFormat::Vmdk
+        );
     }
 
     #[test]
@@ -91,7 +96,10 @@ mod tests {
         f.as_file().write_all(&magic_bytes).unwrap();
         f.as_file().set_len(4096).unwrap();
 
-        let file = File::open(f.as_path()).unwrap();
-        assert_eq!(detect_disk_format(&file).unwrap(), DiskImageFormat::Vmdk);
+        let mut file = File::open(f.as_path()).unwrap();
+        assert_eq!(
+            detect_disk_format(&mut file).unwrap(),
+            DiskImageFormat::Vmdk
+        );
     }
 }

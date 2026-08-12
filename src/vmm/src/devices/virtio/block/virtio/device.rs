@@ -95,7 +95,7 @@ impl DiskProperties {
         is_disk_read_only: bool,
         file_engine_type: FileEngineType,
     ) -> Result<(FileEngine, u64), VirtioBlockError> {
-        let format = block_io::detect_disk_format(&disk_image)
+        let format = block_io::detect_disk_format(&mut disk_image)
             .map_err(|e| VirtioBlockError::BackingFile(e, disk_image_path.to_string()))?;
 
         match format {
