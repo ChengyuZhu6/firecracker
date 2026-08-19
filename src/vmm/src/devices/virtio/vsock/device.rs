@@ -434,7 +434,14 @@ where
                     self.device_type(),
                     self.id()
                 );
-                self.signal_used_queue(EVQ_INDEX).unwrap();
+                if let Err(err) = self.signal_used_queue(EVQ_INDEX) {
+                    error!(
+                        "[{:?}:{}] error signaling event queue: {}",
+                        self.device_type(),
+                        self.id(),
+                        err
+                    );
+                }
             }
 
             // Replay the TX queue notification, like the default `VirtioDevice::kick`

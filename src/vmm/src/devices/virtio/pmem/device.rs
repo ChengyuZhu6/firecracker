@@ -186,7 +186,7 @@ impl PmemMmap {
             .write(!read_only)
             .open(path)
             .map_err(PmemError::BackingFile)?;
-        let file_len = file.metadata().unwrap().len();
+        let file_len = file.metadata().map_err(PmemError::BackingFile)?.len();
         if (file_len == 0) {
             return Err(PmemError::BackingFileZeroSize);
         }
