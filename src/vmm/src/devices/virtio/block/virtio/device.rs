@@ -106,8 +106,10 @@ impl DiskProperties {
                     )));
                 }
 
-                let vmdk_engine = block_io::VmdkFileEngine::from_file(disk_image)
-                    .map_err(|e| VirtioBlockError::FileEngine(block_io::BlockIoError::Vmdk(e)))?;
+                let vmdk_engine = block_io::VmdkFileEngine::from_file(std::path::Path::new(
+                    disk_image_path,
+                ))
+                .map_err(|e| VirtioBlockError::FileEngine(block_io::BlockIoError::Vmdk(e)))?;
                 let disk_size = vmdk_engine.disk_size();
                 Ok((FileEngine::Vmdk(vmdk_engine), disk_size))
             }

@@ -61,9 +61,12 @@ def test_vmdk_readonly_read(uvm):
     _check_vmdk_data(test_microvm.ssh, "/dev/vdb", vmdk.extent_path)
     _check_vmdk_size(test_microvm.ssh, "/dev/vdb", vmdk.size * MB)
 
-    # Writes to a read-only disk must fail from the guest.
+    # Writes to a read-only disk must fail from the guest. When the virtio-blk
+    # device negotiates VIRTIO_BLK_F_RO, the Linux block layer rejects writes
+    # before they ever reach Firecracker, surfacing as EPERM
+    # ("Operation not permitted") rather than an I/O error from the device.
     _, _, stderr = test_microvm.ssh.run("dd if=/dev/zero of=/dev/vdb bs=512 count=1")
-    assert "Input/output error" in stderr
+    assert "Operation not permitted" in stderr
 
 
 def test_vmdk_requires_read_only(uvm):
@@ -81,5 +84,6 @@ def test_vmdk_requires_read_only(uvm):
             drive_id="vmdk",
             path_on_host=jail_path,
             is_read_only=False,
+            is_root_device=False,
             io_engine="Sync",
         )

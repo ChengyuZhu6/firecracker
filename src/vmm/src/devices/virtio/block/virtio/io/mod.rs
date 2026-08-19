@@ -71,9 +71,9 @@ impl FileEngine {
         }
     }
 
-    pub fn from_vmdk(file: File) -> Result<FileEngine, BlockIoError> {
+    pub fn from_vmdk<P: AsRef<std::path::Path>>(path: P) -> Result<FileEngine, BlockIoError> {
         Ok(FileEngine::Vmdk(
-            VmdkFileEngine::from_file(file).map_err(BlockIoError::Vmdk)?,
+            VmdkFileEngine::from_file(path.as_ref()).map_err(BlockIoError::Vmdk)?,
         ))
     }
 

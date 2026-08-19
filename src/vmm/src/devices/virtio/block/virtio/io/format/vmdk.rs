@@ -3,6 +3,7 @@
 
 use std::fs::File;
 use std::io;
+use std::path::Path;
 
 use imago::FormatDriverBuilder;
 use imago::file::File as ImagoFile;
@@ -37,10 +38,8 @@ pub struct VmdkFileEngine {
 }
 
 impl VmdkFileEngine {
-    pub fn from_file(file: File) -> Result<Self, VmdkIoError> {
-        let imago_file: ImagoFile = file.try_into().map_err(VmdkIoError::Open)?;
-
-        let vmdk = Vmdk::<ImagoFile>::builder(imago_file)
+    pub fn from_file(path: &Path) -> Result<Self, VmdkIoError> {
+        let vmdk = Vmdk::<ImagoFile>::builder_path(path)
             .write(false)
             .open(PermissiveImplicitOpenGate::default())
             .map_err(VmdkIoError::Open)?;
@@ -132,8 +131,7 @@ RW {extent_sectors} FLAT "{extent_path}" 0
     fn test_vmdk_engine_open_and_read() {
         let (descriptor, _extent) = create_test_vmdk();
 
-        let file = std::fs::File::open(descriptor.as_path()).unwrap();
-        let engine = VmdkFileEngine::from_file(file).unwrap();
+        let engine = VmdkFileEngine::from_file(descriptor.as_path()).unwrap();
 
         assert_eq!(engine.disk_size(), 1024 * 1024);
 
