@@ -122,6 +122,26 @@ impl DiskProperties {
                 let disk_size = vmdk_engine.disk_size();
                 Ok((FileEngine::Vmdk(vmdk_engine), disk_size))
             }
+            DiskImageFormat::Qcow2 => {
+                if !is_disk_read_only {
+                    return Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
+                        block_io::Qcow2IoError::RequiresReadOnly,
+                    )));
+                }
+                if file_engine_type == FileEngineType::Async {
+                    return Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
+                        block_io::Qcow2IoError::AsyncNotSupported,
+                    )));
+                }
+
+                let qcow2_engine =
+                    block_io::Qcow2FileEngine::from_file(disk_image, Path::new(disk_image_path))
+                        .map_err(|e| {
+                            VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(e))
+                        })?;
+                let disk_size = qcow2_engine.disk_size();
+                Ok((FileEngine::Qcow2(qcow2_engine), disk_size))
+            }
             DiskImageFormat::Raw => {
                 let disk_size = Self::file_size(disk_image_path, &mut disk_image)?;
                 let engine = FileEngine::from_file(disk_image, file_engine_type)
@@ -134,7 +154,9 @@ impl DiskProperties {
     fn file_engine_type(&self) -> FileEngineType {
         match self.file_engine {
             FileEngine::Async(_) => FileEngineType::Async,
-            FileEngine::Sync(_) | FileEngine::Vmdk(_) => FileEngineType::Sync,
+            FileEngine::Sync(_) | FileEngine::Vmdk(_) | FileEngine::Qcow2(_) => {
+                FileEngineType::Sync
+            }
         }
     }
 
@@ -173,8 +195,7 @@ impl DiskProperties {
         self.image_id = Self::build_disk_image_id(&disk_image);
 
         let image_format = DiskImageFormat::from(&self.file_engine);
-        let can_reuse_engine = image_format == DiskImageFormat::Raw
-            && !matches!(self.file_engine, FileEngine::Vmdk(_));
+        let can_reuse_engine = image_format == DiskImageFormat::Raw;
 
         let disk_size = if can_reuse_engine {
             let disk_size = Self::file_size(&disk_image_path, &mut disk_image)?;
@@ -183,7 +204,9 @@ impl DiskProperties {
                     .update_file(disk_image)
                     .map_err(|e| VirtioBlockError::FileEngine(block_io::BlockIoError::Async(e)))?,
                 FileEngine::Sync(engine) => engine.update_file(disk_image),
-                FileEngine::Vmdk(_) => unreachable!("checked by can_reuse_engine above"),
+                FileEngine::Vmdk(_) | FileEngine::Qcow2(_) => {
+                    unreachable!("checked by can_reuse_engine above")
+                }
             }
             disk_size
         } else {
@@ -489,7 +512,7 @@ macro_rules! unwrap_async_file_engine_or_return {
     ($file_engine: expr) => {
         match $file_engine {
             FileEngine::Async(engine) => engine,
-            FileEngine::Sync(_) | FileEngine::Vmdk(_) => {
+            FileEngine::Sync(_) | FileEngine::Vmdk(_) | FileEngine::Qcow2(_) => {
                 error!("The block device doesn't use an async IO engine");
                 return;
             }
@@ -545,7 +568,10 @@ impl VirtioBlock {
 
         if config.blk_size.is_none()
             && config.topology.is_none()
-            && !matches!(disk_properties.file_engine, FileEngine::Vmdk(_))
+            && !matches!(
+                disk_properties.file_engine,
+                FileEngine::Vmdk(_) | FileEngine::Qcow2(_)
+            )
         {
             if let Some((blk_size, topology)) = query_blk_attrs(disk_properties.file_engine.file())
                 .and_then(calculate_blk_size_and_topology)
@@ -818,6 +844,7 @@ impl VirtioBlock {
             FileEngine::Sync(_) => FileEngineType::Sync,
             FileEngine::Async(_) => FileEngineType::Async,
             FileEngine::Vmdk(_) => FileEngineType::Sync,
+            FileEngine::Qcow2(_) => FileEngineType::Sync,
         }
     }
 

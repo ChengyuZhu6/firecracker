@@ -9,7 +9,9 @@ use std::fmt::Debug;
 use std::fs::File;
 
 pub use self::async_io::{AsyncFileEngine, AsyncIoError};
-pub use self::format::{DiskImageFormat, VmdkFileEngine, VmdkIoError};
+pub use self::format::{
+    DiskImageFormat, Qcow2FileEngine, Qcow2IoError, VmdkFileEngine, VmdkIoError,
+};
 pub use self::sync_io::{SyncFileEngine, SyncIoError};
 use crate::devices::virtio::block::virtio::PendingRequest;
 use crate::devices::virtio::block::virtio::device::FileEngineType;
@@ -35,6 +37,8 @@ pub enum BlockIoError {
     Async(AsyncIoError),
     /// VMDK error: {0}
     Vmdk(VmdkIoError),
+    /// QCOW2 error: {0}
+    Qcow2(Qcow2IoError),
 }
 
 impl BlockIoError {
@@ -59,12 +63,14 @@ pub enum FileEngine {
     Async(AsyncFileEngine),
     Sync(SyncFileEngine),
     Vmdk(VmdkFileEngine),
+    Qcow2(Qcow2FileEngine),
 }
 
 impl From<&FileEngine> for DiskImageFormat {
     fn from(engine: &FileEngine) -> Self {
         match engine {
             FileEngine::Vmdk(_) => DiskImageFormat::Vmdk,
+            FileEngine::Qcow2(_) => DiskImageFormat::Qcow2,
             FileEngine::Async(_) | FileEngine::Sync(_) => DiskImageFormat::Raw,
         }
     }
@@ -87,6 +93,9 @@ impl FileEngine {
             FileEngine::Vmdk(_) => {
                 return Err(BlockIoError::Vmdk(VmdkIoError::WriteNotSupported));
             }
+            FileEngine::Qcow2(_) => {
+                return Err(BlockIoError::Qcow2(Qcow2IoError::WriteNotSupported));
+            }
         };
 
         Ok(())
@@ -98,6 +107,9 @@ impl FileEngine {
             FileEngine::Sync(engine) => engine.file(),
             FileEngine::Vmdk(_) => {
                 panic!("file() is not supported for VMDK engine")
+            }
+            FileEngine::Qcow2(_) => {
+                panic!("file() is not supported for QCOW2 engine")
             }
         }
     }
@@ -130,6 +142,13 @@ impl FileEngine {
                 Err(err) => Err(RequestError {
                     req,
                     error: BlockIoError::Vmdk(err),
+                }),
+            },
+            FileEngine::Qcow2(engine) => match engine.read(offset, mem, addr, count) {
+                Ok(count) => Ok(FileEngineOk::Executed(RequestOk { req, count })),
+                Err(err) => Err(RequestError {
+                    req,
+                    error: BlockIoError::Qcow2(err),
                 }),
             },
         }
@@ -165,6 +184,13 @@ impl FileEngine {
                     error: BlockIoError::Vmdk(err),
                 }),
             },
+            FileEngine::Qcow2(engine) => match engine.write(offset, mem, addr, count) {
+                Ok(count) => Ok(FileEngineOk::Executed(RequestOk { req, count })),
+                Err(err) => Err(RequestError {
+                    req,
+                    error: BlockIoError::Qcow2(err),
+                }),
+            },
         }
     }
 
@@ -194,6 +220,13 @@ impl FileEngine {
                     error: BlockIoError::Vmdk(err),
                 }),
             },
+            FileEngine::Qcow2(engine) => match engine.flush() {
+                Ok(_) => Ok(FileEngineOk::Executed(RequestOk { req, count: 0 })),
+                Err(err) => Err(RequestError {
+                    req,
+                    error: BlockIoError::Qcow2(err),
+                }),
+            },
         }
     }
 
@@ -221,6 +254,10 @@ impl FileEngine {
                 req,
                 error: BlockIoError::Vmdk(VmdkIoError::WriteNotSupported),
             }),
+            FileEngine::Qcow2(_) => Err(RequestError {
+                req,
+                error: BlockIoError::Qcow2(Qcow2IoError::WriteNotSupported),
+            }),
         }
     }
 
@@ -229,6 +266,7 @@ impl FileEngine {
             FileEngine::Async(engine) => engine.drain(discard).map_err(BlockIoError::Async),
             FileEngine::Sync(_engine) => Ok(()),
             FileEngine::Vmdk(_engine) => Ok(()),
+            FileEngine::Qcow2(_engine) => Ok(()),
         }
     }
 
@@ -239,6 +277,7 @@ impl FileEngine {
             }
             FileEngine::Sync(engine) => engine.flush().map_err(BlockIoError::Sync),
             FileEngine::Vmdk(engine) => engine.flush().map_err(BlockIoError::Vmdk),
+            FileEngine::Qcow2(engine) => engine.flush().map_err(BlockIoError::Qcow2),
         }
     }
 }
