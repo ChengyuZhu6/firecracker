@@ -94,7 +94,7 @@ impl FileEngine {
                 return Err(BlockIoError::Vmdk(VmdkIoError::UnsupportedOperation));
             }
             FileEngine::Qcow2(_) => {
-                return Err(BlockIoError::Qcow2(Qcow2IoError::WriteNotSupported));
+                return Err(BlockIoError::Qcow2(Qcow2IoError::UnsupportedOperation));
             }
         };
 
@@ -256,7 +256,7 @@ impl FileEngine {
             }),
             FileEngine::Qcow2(_) => Err(RequestError {
                 req,
-                error: BlockIoError::Qcow2(Qcow2IoError::WriteNotSupported),
+                error: BlockIoError::Qcow2(Qcow2IoError::DiscardNotSupported),
             }),
         }
     }

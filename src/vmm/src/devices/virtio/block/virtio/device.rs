@@ -122,22 +122,18 @@ impl DiskProperties {
                 Ok((FileEngine::Vmdk(vmdk_engine), disk_size))
             }
             DiskImageFormat::Qcow2 => {
-                if !is_disk_read_only {
-                    return Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
-                        block_io::Qcow2IoError::RequiresReadOnly,
-                    )));
-                }
                 if file_engine_type == FileEngineType::Async {
                     return Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
                         block_io::Qcow2IoError::AsyncNotSupported,
                     )));
                 }
 
-                let qcow2_engine =
-                    block_io::Qcow2FileEngine::from_file(disk_image, Path::new(disk_image_path))
-                        .map_err(|e| {
-                            VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(e))
-                        })?;
+                let qcow2_engine = block_io::Qcow2FileEngine::from_file(
+                    disk_image,
+                    Path::new(disk_image_path),
+                    is_disk_read_only,
+                )
+                .map_err(|e| VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(e)))?;
                 let disk_size = qcow2_engine.disk_size();
                 Ok((FileEngine::Qcow2(qcow2_engine), disk_size))
             }
