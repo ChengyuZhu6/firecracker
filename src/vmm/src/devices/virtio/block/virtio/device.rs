@@ -123,22 +123,18 @@ impl DiskProperties {
                 Ok((FileEngine::Vmdk(vmdk_engine), disk_size))
             }
             DiskImageFormat::Qcow2 => {
-                if !is_disk_read_only {
-                    return Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
-                        block_io::Qcow2IoError::RequiresReadOnly,
-                    )));
-                }
                 if file_engine_type == FileEngineType::Async {
                     return Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
                         block_io::Qcow2IoError::AsyncNotSupported,
                     )));
                 }
 
-                let qcow2_engine =
-                    block_io::Qcow2FileEngine::from_file(disk_image, Path::new(disk_image_path))
-                        .map_err(|e| {
-                            VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(e))
-                        })?;
+                let qcow2_engine = block_io::Qcow2FileEngine::from_file(
+                    disk_image,
+                    Path::new(disk_image_path),
+                    is_disk_read_only,
+                )
+                .map_err(|e| VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(e)))?;
                 let disk_size = qcow2_engine.disk_size();
                 Ok((FileEngine::Qcow2(qcow2_engine), disk_size))
             }
@@ -192,12 +188,11 @@ impl DiskProperties {
         is_disk_read_only: bool,
     ) -> Result<(), VirtioBlockError> {
         let mut disk_image = Self::open_file(&disk_image_path, is_disk_read_only)?;
-        self.image_id = Self::build_disk_image_id(&disk_image);
+        let image_id = Self::build_disk_image_id(&disk_image);
 
         let image_format = DiskImageFormat::from(&self.file_engine);
-        let can_reuse_engine = image_format == DiskImageFormat::Raw;
 
-        let disk_size = if can_reuse_engine {
+        let disk_size = if image_format == DiskImageFormat::Raw {
             let disk_size = Self::file_size(&disk_image_path, &mut disk_image)?;
             match &mut self.file_engine {
                 FileEngine::Async(engine) => engine
@@ -205,7 +200,7 @@ impl DiskProperties {
                     .map_err(|e| VirtioBlockError::FileEngine(block_io::BlockIoError::Async(e)))?,
                 FileEngine::Sync(engine) => engine.update_file(disk_image),
                 FileEngine::Vmdk(_) | FileEngine::Qcow2(_) => {
-                    unreachable!("checked by can_reuse_engine above")
+                    unreachable!("checked by image_format above")
                 }
             }
             disk_size
@@ -222,6 +217,7 @@ impl DiskProperties {
         };
 
         self.nsectors = disk_size >> SECTOR_SHIFT;
+        self.image_id = image_id;
         self.file_path = disk_image_path;
 
         Ok(())

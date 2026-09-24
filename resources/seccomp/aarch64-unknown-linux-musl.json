@@ -99,6 +99,10 @@
                 "comment": "Used for drive patching & rescanning, for reading the local timezone from /etc/localtime"
             },
             {
+                "syscall": "fstatfs",
+                "comment": "Used by the writable imago QCOW2 disk image backend"
+            },
+            {
                 "syscall": "ftruncate",
                 "comment": "Used for snapshotting"
             },
@@ -108,7 +112,11 @@
             },
             {
                 "syscall": "preadv",
-                "comment": "Used by the imago VMDK disk image backend"
+                "comment": "Used by the imago disk image backends"
+            },
+            {
+                "syscall": "pwritev",
+                "comment": "Used by the writable imago QCOW2 disk image backend"
             },
             {
                 "syscall": "mremap",

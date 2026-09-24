@@ -86,21 +86,6 @@ impl FileEngine {
         }
     }
 
-    pub fn update_file_path(&mut self, file: File) -> Result<(), BlockIoError> {
-        match self {
-            FileEngine::Async(engine) => engine.update_file(file).map_err(BlockIoError::Async)?,
-            FileEngine::Sync(engine) => engine.update_file(file),
-            FileEngine::Vmdk(_) => {
-                return Err(BlockIoError::Vmdk(VmdkIoError::WriteNotSupported));
-            }
-            FileEngine::Qcow2(_) => {
-                return Err(BlockIoError::Qcow2(Qcow2IoError::WriteNotSupported));
-            }
-        };
-
-        Ok(())
-    }
-
     pub fn file(&self) -> &File {
         match self {
             FileEngine::Async(engine) => engine.file(),
@@ -256,7 +241,7 @@ impl FileEngine {
             }),
             FileEngine::Qcow2(_) => Err(RequestError {
                 req,
-                error: BlockIoError::Qcow2(Qcow2IoError::WriteNotSupported),
+                error: BlockIoError::Qcow2(Qcow2IoError::DiscardNotSupported),
             }),
         }
     }
@@ -542,9 +527,5 @@ pub mod tests {
         ));
         engine.drain(true).unwrap();
         engine.drain_and_flush(true).unwrap();
-        assert!(matches!(
-            engine.update_file_path(File::open(descriptor).unwrap()),
-            Err(BlockIoError::Vmdk(VmdkIoError::WriteNotSupported))
-        ));
     }
 }
