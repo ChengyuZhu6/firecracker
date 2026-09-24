@@ -121,6 +121,26 @@ impl DiskProperties {
                 let disk_size = vmdk_engine.disk_size();
                 Ok((FileEngine::Vmdk(vmdk_engine), disk_size))
             }
+            DiskImageFormat::Qcow2 => {
+                if !is_disk_read_only {
+                    return Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
+                        block_io::Qcow2IoError::RequiresReadOnly,
+                    )));
+                }
+                if file_engine_type == FileEngineType::Async {
+                    return Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
+                        block_io::Qcow2IoError::AsyncNotSupported,
+                    )));
+                }
+
+                let qcow2_engine =
+                    block_io::Qcow2FileEngine::from_file(disk_image, Path::new(disk_image_path))
+                        .map_err(|e| {
+                            VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(e))
+                        })?;
+                let disk_size = qcow2_engine.disk_size();
+                Ok((FileEngine::Qcow2(qcow2_engine), disk_size))
+            }
             DiskImageFormat::Raw => {
                 let disk_size = Self::file_size(disk_image_path, &mut disk_image)?;
                 let engine = FileEngine::from_file(disk_image, file_engine_type)
@@ -133,7 +153,9 @@ impl DiskProperties {
     fn file_engine_type(&self) -> FileEngineType {
         match self.file_engine {
             FileEngine::Async(_) => FileEngineType::Async,
-            FileEngine::Sync(_) | FileEngine::Vmdk(_) => FileEngineType::Sync,
+            FileEngine::Sync(_) | FileEngine::Vmdk(_) | FileEngine::Qcow2(_) => {
+                FileEngineType::Sync
+            }
         }
     }
 
@@ -584,7 +606,10 @@ impl VirtioBlock {
 
         if config.blk_size.is_none()
             && config.topology.is_none()
-            && !matches!(resources[0].disk.file_engine, FileEngine::Vmdk(_))
+            && !matches!(
+                resources[0].disk.file_engine,
+                FileEngine::Vmdk(_) | FileEngine::Qcow2(_)
+            )
         {
             if let Some((blk_size, topology)) =
                 query_blk_attrs(resources[0].disk.file_engine.file())

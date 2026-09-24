@@ -97,7 +97,7 @@ macro_rules! unwrap_async_file_engine_or_return {
     ($file_engine: expr) => {
         match $file_engine {
             FileEngine::Async(engine) => engine,
-            FileEngine::Sync(_) | FileEngine::Vmdk(_) => {
+            FileEngine::Sync(_) | FileEngine::Vmdk(_) | FileEngine::Qcow2(_) => {
                 error!("The block device doesn't use an async IO engine");
                 return;
             }
