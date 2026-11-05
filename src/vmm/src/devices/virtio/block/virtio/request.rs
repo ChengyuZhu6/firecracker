@@ -182,7 +182,7 @@ impl PendingRequest {
                 }
             }
             (Ok(transferred_data_len), RequestType::GetDeviceID) => {
-                Status::from_data(self.data_len, transferred_data_len, true)
+                Status::from_data(VIRTIO_BLK_ID_BYTES, transferred_data_len, true)
             }
             (Err(IoErr::UnsupportedRequest(op)), _) | (_, RequestType::Unsupported(op)) => {
                 Status::Unsupported { op }
