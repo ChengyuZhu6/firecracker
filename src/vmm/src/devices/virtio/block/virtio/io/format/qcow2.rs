@@ -237,6 +237,33 @@ pub(crate) mod tests {
             engine.write(0, &mem, addr, 512),
             Err(Qcow2IoError::Write(_))
         ));
+
+        let completed = 2 * IO_BUFFER_SIZE;
+        let (mapping, _) = engine
+            .access
+            .get_mapping(512 + completed as u64, 512)
+            .unwrap();
+        let imago::Mapping::Raw { offset, .. } = mapping else {
+            panic!("Expected allocated data");
+        };
+        file.as_file().set_len(offset + 511).unwrap();
+        mem.write_slice(&vec![0x5d; count], addr).unwrap();
+        mem.reset_dirty();
+        let Err(Qcow2IoError::Read {
+            source,
+            completed: actual_completed,
+        }) = engine.read(512, &mem, addr, u32::try_from(count).unwrap())
+        else {
+            panic!("Expected short-read error");
+        };
+        assert_eq!(source.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(actual_completed as usize, completed);
+        mem.read_slice(&mut actual, addr).unwrap();
+        assert_eq!(&actual[..completed], &data[..completed]);
+        assert!(actual[completed..].iter().all(|byte| *byte == 0x5d));
+        let slice = mem.get_slice(addr, count).unwrap();
+        assert!(slice.bitmap().dirty_at(completed - 1));
+        assert!(!slice.bitmap().dirty_at(completed));
     }
 
     #[test]

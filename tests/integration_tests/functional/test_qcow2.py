@@ -3,6 +3,7 @@
 """Exercise independent qemu-img QCOW2 images through real guest block I/O."""
 
 import hashlib
+import json
 import os
 import shutil
 from pathlib import Path
@@ -22,12 +23,13 @@ DISK_SIZE = 4 * 1024 * 1024
 GUEST_DATA = "/dev/shm/qcow2-data"
 
 
-def _convert(source, target):
+def _convert(source, target, *, compressed=False):
     """Generate a self-contained image without using the implementation under test."""
     check_output(
         [
             "qemu-img",
             "convert",
+            *(["-c"] if compressed else []),
             "-f",
             "raw",
             "-O",
@@ -40,7 +42,7 @@ def _convert(source, target):
     )
 
 
-def _image(vm, name, seed=0):
+def _image(vm, name, seed=0, *, compressed=False):
     """Create allocated nonzero clusters, a sparse middle, and a nonzero last sector."""
     raw = Path(vm.fsfiles) / f"{name}.raw"
     image = raw.with_suffix(".qcow2")
@@ -54,7 +56,7 @@ def _image(vm, name, seed=0):
         output.write(allocated)
         output.seek(DISK_SIZE - 512)
         output.write(expected[-512:])
-    _convert(raw, image)
+    _convert(raw, image, compressed=compressed)
     return image, expected
 
 
@@ -120,12 +122,13 @@ def _assert_readonly_multiqueue(vm, expected):
         assert "Operation not permitted" in stderr
 
 
-def test_qcow2_writable_io(uvm, num_queues):
-    """Repeated direct writes preserve patterned, partial-cluster, sparse and tail sectors."""
+@pytest.mark.parametrize("compressed", [False, True])
+def test_qcow2_writable_io(uvm, num_queues, compressed):
+    """Direct writes preserve ordinary and compressed images across partial-cluster COW."""
     uvm.spawn()
     uvm.basic_config()
     uvm.add_net_iface()
-    image, expected = _image(uvm, "writable")
+    image, expected = _image(uvm, "writable", compressed=compressed)
     uvm.add_drive(
         "qcow2",
         image,
@@ -151,6 +154,46 @@ def test_qcow2_writable_io(uvm, num_queues):
 
     uvm.kill()
     _check_closed_image(image, expected)
+
+
+def test_qcow2_live_truncation(uvm, num_queues):
+    """Missing allocated bytes fail guest I/O without changing valid or sparse reads."""
+    uvm.spawn()
+    uvm.basic_config()
+    uvm.add_net_iface()
+    image, expected = _image(uvm, "truncated")
+    _, stdout, _ = check_output(
+        ["qemu-img", "map", "--output=json", "-f", "qcow2", str(image)]
+    )
+    tail = next(
+        extent
+        for extent in json.loads(stdout)
+        if extent["start"] <= DISK_SIZE - 512 < extent["start"] + extent["length"]
+    )
+    assert tail["data"] and tail["present"]
+    host_offset = tail["offset"] + DISK_SIZE - 512 - tail["start"]
+    uvm.add_drive("qcow2", image, image_format="Qcow2", num_queues=num_queues)
+    uvm.start()
+    _assert_queue_mode(uvm, num_queues)
+    _assert_guest_data(uvm, expected)
+
+    for remaining in [511, 0]:
+        os.truncate(image, host_offset + remaining)
+        rc, _, stderr = uvm.ssh.run(
+            "dd if=/dev/vdb of=/dev/shm/truncated-read bs=512"
+            f" skip={DISK_SIZE // 512 - 1} count=1 iflag=direct status=none"
+        )
+        assert rc != 0
+        assert "Input/output error" in stderr
+        _, stdout, _ = uvm.ssh.check_output(
+            "dd if=/dev/vdb bs=512 count=1 iflag=direct status=none | sha256sum"
+        )
+        assert stdout.split()[0] == _digest(expected[:512])
+        _, stdout, _ = uvm.ssh.check_output(
+            "dd if=/dev/vdb bs=512 skip=1024 count=1 iflag=direct status=none"
+            " | sha256sum"
+        )
+        assert stdout.split()[0] == _digest(bytes(512))
 
 
 @pytest.mark.parametrize("cache_type", ["Unsafe", "Writeback"])
