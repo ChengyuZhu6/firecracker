@@ -3,6 +3,7 @@
 
 use std::fs::File;
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use imago::file::File as ImagoFile;
@@ -20,8 +21,12 @@ pub enum Qcow2IoError {
     Open(io::Error),
     /// QCOW2 backend does not support the async file engine.
     AsyncNotSupported,
-    /// QCOW2 read error: {0}
-    Read(io::Error),
+    /// Writable QCOW2 images do not support multiple queues.
+    MultiQueueNotSupported,
+    /// QCOW2 images with multiple queues do not support disk replacement.
+    MultiQueuePatchNotSupported,
+    /// QCOW2 read error after {completed} bytes: {source}
+    Read { source: io::Error, completed: u32 },
     /// QCOW2 write error: {0}
     Write(io::Error),
     /// QCOW2 discard is not supported.
@@ -30,20 +35,30 @@ pub enum Qcow2IoError {
     UnsupportedOperation,
     /// Guest memory error: {0}
     GuestMemory(GuestMemoryError),
-    /// QCOW2 flush error: {0}
+    /// QCOW2 metadata writeback error: {0}
+    MetadataFlush(io::Error),
+    /// QCOW2 sync error: {0}
     Flush(io::Error),
 }
 
-const READ_BUFFER_SIZE: usize = 64 * 1024;
+const IO_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub struct Qcow2FileEngine {
     access: FormatAccess<ImagoFile>,
-    read_buffer: Box<[u8]>,
+    io_buffer: Box<[u8]>,
+    file_id: (u64, u64),
 }
 
 impl Qcow2FileEngine {
     pub fn from_file(file: File, path: &Path, read_only: bool) -> Result<Self, Qcow2IoError> {
+        let metadata = file.metadata().map_err(Qcow2IoError::Open)?;
+        if read_only {
+            file.try_lock_shared()
+        } else {
+            file.try_lock()
+        }
+        .map_err(|err| Qcow2IoError::Open(err.into()))?;
         let storage = ImagoFile::from_open_file(
             file,
             StorageOpenOptions::new()
@@ -53,14 +68,21 @@ impl Qcow2FileEngine {
         )
         .map_err(Qcow2IoError::Open)?;
         let qcow2 = Qcow2::<ImagoFile>::builder(storage)
+            .require_self_contained(true)
             .write(!read_only)
             .open(DenyImplicitOpenGate::default())
             .map_err(Qcow2IoError::Open)?;
 
         Ok(Self {
             access: FormatAccess::new(qcow2),
-            read_buffer: vec![0; READ_BUFFER_SIZE].into_boxed_slice(),
+            io_buffer: vec![0; IO_BUFFER_SIZE].into_boxed_slice(),
+            file_id: (metadata.dev(), metadata.ino()),
         })
+    }
+
+    pub fn same_file(&self, file: &File) -> io::Result<bool> {
+        let metadata = file.metadata()?;
+        Ok(self.file_id == (metadata.dev(), metadata.ino()))
     }
 
     pub fn disk_size(&self) -> u64 {
@@ -77,29 +99,32 @@ impl Qcow2FileEngine {
         let slice = mem
             .get_slice(addr, count as usize)
             .map_err(Qcow2IoError::GuestMemory)?;
-        offset.checked_add(u64::from(count)).ok_or_else(|| {
-            Qcow2IoError::Read(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "QCOW2 read offset overflow",
-            ))
-        })?;
+        offset
+            .checked_add(u64::from(count))
+            .ok_or_else(|| Qcow2IoError::Read {
+                source: io::Error::new(io::ErrorKind::InvalidInput, "QCOW2 read offset overflow"),
+                completed: 0,
+            })?;
 
-        for start in (0..slice.len()).step_by(READ_BUFFER_SIZE) {
-            let len = (slice.len() - start).min(READ_BUFFER_SIZE);
+        for start in (0..slice.len()).step_by(IO_BUFFER_SIZE) {
+            let len = (slice.len() - start).min(IO_BUFFER_SIZE);
             self.access
-                .read(&mut self.read_buffer[..len], offset + start as u64)
-                .map_err(Qcow2IoError::Read)?;
+                .read(&mut self.io_buffer[..len], offset + start as u64)
+                .map_err(|source| Qcow2IoError::Read {
+                    source,
+                    completed: u32::try_from(start).unwrap(),
+                })?;
             slice
                 .subslice(start, len)
                 .map_err(|err| Qcow2IoError::GuestMemory(err.into()))?
-                .copy_from(&self.read_buffer[..len]);
+                .copy_from(&self.io_buffer[..len]);
         }
 
         Ok(count)
     }
 
     pub fn write(
-        &self,
+        &mut self,
         offset: u64,
         mem: &GuestMemoryMmap,
         addr: GuestAddress,
@@ -115,15 +140,14 @@ impl Qcow2FileEngine {
             ))
         })?;
 
-        let mut buffer = vec![0; READ_BUFFER_SIZE.min(slice.len())];
-        for start in (0..slice.len()).step_by(READ_BUFFER_SIZE) {
-            let len = (slice.len() - start).min(READ_BUFFER_SIZE);
+        for start in (0..slice.len()).step_by(IO_BUFFER_SIZE) {
+            let len = (slice.len() - start).min(IO_BUFFER_SIZE);
             slice
                 .subslice(start, len)
                 .map_err(|err| Qcow2IoError::GuestMemory(err.into()))?
-                .copy_to(&mut buffer[..len]);
+                .copy_to(&mut self.io_buffer[..len]);
             self.access
-                .write(&buffer[..len], offset + start as u64)
+                .write(&self.io_buffer[..len], offset + start as u64)
                 .map_err(Qcow2IoError::Write)?;
         }
 
@@ -131,7 +155,110 @@ impl Qcow2FileEngine {
     }
 
     pub fn flush(&self) -> Result<(), Qcow2IoError> {
-        self.access.flush().map_err(Qcow2IoError::Flush)?;
+        self.access.flush().map_err(Qcow2IoError::MetadataFlush)?;
         self.access.sync().map_err(Qcow2IoError::Flush)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use imago::FormatCreateBuilder;
+    use vmm_sys_util::tempfile::TempFile;
+
+    use super::*;
+    use crate::test_utils::single_region_mem_dirty_tracking;
+    use crate::vstate::memory::{Bitmap, Bytes, GuestMemoryExtension};
+
+    pub(crate) fn create_test_qcow2() -> TempFile {
+        let file = TempFile::new().unwrap();
+        let storage = ImagoFile::from_open_file(
+            file.as_file().try_clone().unwrap(),
+            StorageOpenOptions::new()
+                .filename(file.as_path())
+                .write(true)
+                .direct(false),
+        )
+        .unwrap();
+        Qcow2::<ImagoFile>::create_builder(storage)
+            .size(2 * 1024 * 1024)
+            .create()
+            .unwrap();
+        file
+    }
+
+    #[test]
+    fn test_qcow2_read_write_persistence() {
+        let file = create_test_qcow2();
+        let count = 2 * IO_BUFFER_SIZE + 512;
+        let addr = GuestAddress(4096);
+        let mem = single_region_mem_dirty_tracking(count + 8192);
+        let data = vec![0xa7; count];
+        mem.write_slice(&data, addr).unwrap();
+        let mut engine = Qcow2FileEngine::from_file(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(file.as_path())
+                .unwrap(),
+            file.as_path(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(engine.disk_size(), 2 * 1024 * 1024);
+        assert_eq!(
+            engine
+                .write(512, &mem, addr, u32::try_from(count).unwrap())
+                .unwrap(),
+            u32::try_from(count).unwrap()
+        );
+        engine.flush().unwrap();
+        drop(engine);
+
+        let mut engine =
+            Qcow2FileEngine::from_file(File::open(file.as_path()).unwrap(), file.as_path(), true)
+                .unwrap();
+        mem.write_slice(&vec![0; count], addr).unwrap();
+        mem.reset_dirty();
+        assert_eq!(
+            engine
+                .read(512, &mem, addr, u32::try_from(count).unwrap())
+                .unwrap(),
+            u32::try_from(count).unwrap()
+        );
+        let mut actual = vec![0; count];
+        mem.read_slice(&mut actual, addr).unwrap();
+        assert_eq!(actual, data);
+        let slice = mem.get_slice(GuestAddress(0), count + 8192).unwrap();
+        assert!(!slice.bitmap().dirty_at(0));
+        assert!(slice.bitmap().dirty_at(4096));
+        assert!(slice.bitmap().dirty_at(4096 + count - 1));
+        assert!(!slice.bitmap().dirty_at(count + 8192 - 1));
+        assert!(matches!(
+            engine.write(0, &mem, addr, 512),
+            Err(Qcow2IoError::Write(_))
+        ));
+    }
+
+    #[test]
+    fn test_qcow2_read_overflow_does_not_dirty_memory() {
+        let file = create_test_qcow2();
+        let mut engine =
+            Qcow2FileEngine::from_file(File::open(file.as_path()).unwrap(), file.as_path(), true)
+                .unwrap();
+        let mem = single_region_mem_dirty_tracking(4096);
+        assert!(matches!(
+            engine.read(u64::MAX, &mem, GuestAddress(0), 512),
+            Err(Qcow2IoError::Read { completed: 0, .. })
+        ));
+        assert!(matches!(
+            engine.read(0, &mem, GuestAddress(4096), 512),
+            Err(Qcow2IoError::GuestMemory(_))
+        ));
+        assert!(
+            !mem.get_slice(GuestAddress(0), 4096)
+                .unwrap()
+                .bitmap()
+                .dirty_at(0)
+        );
     }
 }

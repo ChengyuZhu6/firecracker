@@ -187,6 +187,18 @@ impl DiskProperties {
     ) -> Result<(), VirtioBlockError> {
         let mut disk_image = Self::open_file(&disk_image_path, is_disk_read_only)?;
         let image_id = Self::build_disk_image_id(&disk_image);
+        if let FileEngine::Qcow2(engine) = &self.file_engine
+            && engine
+                .same_file(&disk_image)
+                .map_err(|err| VirtioBlockError::BackingFile(err, disk_image_path.clone()))?
+        {
+            engine
+                .flush()
+                .map_err(block_io::BlockIoError::Qcow2)
+                .map_err(VirtioBlockError::FileEngine)?;
+            self.image_id = image_id;
+            return Ok(());
+        }
 
         // A raw image is a single file the engine can be pointed at. Formatted images
         // are parsed into engine state when they are opened (for VMDK: the descriptor
@@ -207,6 +219,12 @@ impl DiskProperties {
                 self.file_engine_type(),
                 image_format,
             )?;
+            if let FileEngine::Qcow2(engine) = &self.file_engine {
+                engine
+                    .flush()
+                    .map_err(block_io::BlockIoError::Qcow2)
+                    .map_err(VirtioBlockError::FileEngine)?;
+            }
             self.file_engine = file_engine;
             disk_size
         };
@@ -550,10 +568,20 @@ impl VirtioBlock {
         if config.discard && config.file_engine_type == FileEngineType::Async {
             return Err(VirtioBlockError::DiscardAsyncUnsupported);
         }
+        if config.discard && config.image_format == DiskImageFormat::Qcow2 {
+            return Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
+                block_io::Qcow2IoError::DiscardNotSupported,
+            )));
+        }
 
         let num_queues = config
             .num_queues
             .map_or(DEFAULT_BLOCK_NUM_QUEUES, NonZeroU16::get);
+        if config.image_format == DiskImageFormat::Qcow2 && !config.is_read_only && num_queues > 1 {
+            return Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
+                block_io::Qcow2IoError::MultiQueueNotSupported,
+            )));
+        }
         let mut resources = Vec::with_capacity(usize::from(num_queues));
         for queue_idx in 0..num_queues {
             resources.push(BlockResources {
@@ -734,6 +762,13 @@ impl VirtioBlock {
 
     /// Update the backing file and the config space of the block device.
     pub fn update_disk_image(&mut self, disk_image_path: String) -> Result<(), VirtioBlockError> {
+        if self.config.image_format == DiskImageFormat::Qcow2
+            && self.config.num_queues.is_some_and(|count| count.get() > 1)
+        {
+            return Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
+                block_io::Qcow2IoError::MultiQueuePatchNotSupported,
+            )));
+        }
         let config_path = disk_image_path.clone();
         let read_only = self.config.is_read_only;
         let nsectors = match &mut self.state {
@@ -792,20 +827,23 @@ impl VirtioBlock {
     }
 
     /// Prepare device for being snapshotted.
-    pub fn prepare_save(&mut self) {
+    pub fn prepare_save(&mut self) -> Result<(), crate::devices::virtio::persist::PersistError> {
         match &mut self.state {
-            BlockRuntimeState::Inline(worker) => worker.prepare_save(FlushMode::DrainAndFlush),
+            BlockRuntimeState::Inline(worker) => worker
+                .prepare_save(FlushMode::DrainAndFlush)
+                .map_err(crate::devices::virtio::persist::PersistError::BlockIo),
             BlockRuntimeState::Threaded(active) => {
                 let (last, rest) = active
                     .worker_handles
                     .split_last()
                     .expect("threaded block device must have at least one worker");
                 for handle in rest {
-                    handle.pause(FlushMode::Drain);
+                    handle.pause(FlushMode::Drain)?;
                 }
-                last.pause(FlushMode::DrainAndFlush);
+                last.pause(FlushMode::DrainAndFlush)
+                    .map_err(crate::devices::virtio::persist::PersistError::BlockIo)
             }
-            BlockRuntimeState::Configuring(_, _) => {}
+            BlockRuntimeState::Configuring(_, _) => Ok(()),
             BlockRuntimeState::Placeholder => unreachable!("not a runtime state"),
         }
     }
@@ -2372,7 +2410,7 @@ mod tests {
             // Add a batch of flush requests.
             add_flush_requests_batch(&mut block, &vq, 5);
             simulate_queue_event(&mut block, None);
-            block.prepare_save();
+            block.prepare_save().unwrap();
 
             // Check that all the pending flush requests were processed during `prepare_save()`.
             check_flush_requests_batch(5, &vq);
@@ -2660,14 +2698,14 @@ mod tests {
         // A running worker answers a commit request too.
         block.commit_dirty();
 
-        block.prepare_save();
+        block.prepare_save().unwrap();
         read_blk_req_descriptors(vq);
         vq.dtable[1].len.set(VIRTIO_BLK_ID_BYTES);
         mem.write_obj::<u32>(VIRTIO_BLK_T_GET_ID, GuestAddress(vq.dtable[0].addr.get()))
             .unwrap();
         mem.reset_dirty();
         block.kick();
-        block.prepare_save();
+        block.prepare_save().unwrap();
         assert_eq!(vq.used.idx.get(), 1);
         assert!(!used_ring_dirty(mem, vq));
     }
@@ -2720,7 +2758,7 @@ mod tests {
         set_queue(&mut block, 0, vq.create_queue());
         block.activate(mem.clone(), default_interrupt()).unwrap();
 
-        block.prepare_save();
+        block.prepare_save().unwrap();
         read_blk_req_descriptors(&vq);
         let request_type_addr = GuestAddress(vq.dtable[0].addr.get());
         let status_addr = GuestAddress(vq.dtable[2].addr.get());
@@ -2730,7 +2768,7 @@ mod tests {
 
         block.kick();
         // A second pause waits until the resumed worker has processed its queue.
-        block.prepare_save();
+        block.prepare_save().unwrap();
 
         assert_eq!(vq.used.idx.get(), 1);
         assert_eq!(vq.used.ring[0].get().id, 0);
@@ -2747,7 +2785,7 @@ mod tests {
             set_queue(&mut block, 0, vq.create_queue());
             block.set_acked_features(1);
             block.activate(mem, default_interrupt()).unwrap();
-            block.prepare_save();
+            block.prepare_save().unwrap();
 
             assert!(block.reset());
             assert!(!block.is_activated());
@@ -2774,6 +2812,40 @@ mod tests {
         block.activate(mem, default_interrupt()).unwrap();
 
         block.reset();
+    }
+
+    #[test]
+    fn test_qcow2_num_queues() {
+        use crate::devices::virtio::block::virtio::io::format::qcow2::tests::create_test_qcow2;
+        use crate::devices::virtio::block::virtio::test_utils::default_config;
+
+        let file = create_test_qcow2();
+        for read_only in [false, true] {
+            for num_queues in [None, NonZeroU16::new(1), NonZeroU16::new(2)] {
+                let mut config = default_config(
+                    file.as_path().to_str().unwrap().to_string(),
+                    FileEngineType::Sync,
+                );
+                config.image_format = DiskImageFormat::Qcow2;
+                config.is_read_only = read_only;
+                config.num_queues = num_queues;
+                let result = VirtioBlock::new(config);
+                if !read_only && num_queues == NonZeroU16::new(2) {
+                    assert!(matches!(
+                        result,
+                        Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
+                            block_io::Qcow2IoError::MultiQueueNotSupported
+                        )))
+                    ));
+                } else {
+                    let block = result.unwrap();
+                    assert_eq!(
+                        block.num_queues(),
+                        num_queues.map_or(1, |n| usize::from(n.get()))
+                    );
+                }
+            }
+        }
     }
 
     #[test]

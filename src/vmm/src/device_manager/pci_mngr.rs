@@ -412,6 +412,10 @@ impl<'a> Persist<'a> for PciDevices {
     type Error = DevicePersistError;
 
     fn save(&self) -> Self::State {
+        self.try_save().expect("Failed to save PCI devices")
+    }
+
+    fn try_save(&self) -> Result<Self::State, Self::Error> {
         let mut state = DeviceStates::default();
 
         for pci_dev in self.virtio_devices.values() {
@@ -421,7 +425,7 @@ impl<'a> Persist<'a> for PciDevices {
             // so that, if we modify the transport state while preparing the device, e.g. sending
             // an interrupt to the guest, this is correctly captured in the saved transport state.
             let mut locked_virtio_dev = virtio_dev.lock().expect("Poisoned lock");
-            locked_virtio_dev.prepare_save();
+            locked_virtio_dev.prepare_save()?;
             let transport_state = locked_pci_dev.state();
 
             match locked_virtio_dev.device_type() {
@@ -546,10 +550,10 @@ impl<'a> Persist<'a> for PciDevices {
             .map(|port| port.lock().expect("Poisoned lock").state())
             .collect();
 
-        PciDevicesState {
+        Ok(PciDevicesState {
             virtio_devices: state,
             root_ports,
-        }
+        })
     }
 
     fn restore(

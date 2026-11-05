@@ -19,6 +19,25 @@ FC_FILTER_PATH = Path(f"../resources/seccomp/{ARCH}-unknown-linux-musl.json")
 FILTER_THREADS = list(json.loads(FC_FILTER_PATH.read_text(encoding="ascii")))
 
 
+@pytest.mark.parametrize("arch", ["x86_64", "aarch64"])
+def test_qcow2_worker_syscalls(arch):
+    """Both architectures must allow QCOW2 I/O and drive patching on workers."""
+    path = FC_FILTER_PATH.with_name(f"{arch}-unknown-linux-musl.json")
+    worker_filter = json.loads(path.read_text(encoding="ascii"))["blk_worker"]
+    assert worker_filter["filter_action"] == "allow"
+    unrestricted = {
+        rule["syscall"] for rule in worker_filter["filter"] if not rule.get("args")
+    }
+    assert {
+        "preadv",
+        "pwritev",
+        "fstatfs",
+        "ftruncate",
+        "fsync",
+        "flock",
+    } <= unrestricted
+
+
 @pytest.fixture
 def bin_test_syscall(tmp_path):
     """Build the test_syscall binary."""

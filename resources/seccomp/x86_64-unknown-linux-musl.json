@@ -54,6 +54,9 @@
                 "syscall": "fsync"
             },
             {
+                "syscall": "flock"
+            },
+            {
                 "syscall": "fallocate",
                 "comment": "Used by the VirtIO block device to punch holes for discard on regular backing files",
                 "args": [
@@ -1717,7 +1720,19 @@
             },
             {
                 "syscall": "preadv",
-                "comment": "Used by imago to read VMDK extents"
+                "comment": "Used by the imago disk image backends"
+            },
+            {
+                "syscall": "pwritev",
+                "comment": "Used by the writable imago QCOW2 disk image backend"
+            },
+            {
+                "syscall": "fstatfs",
+                "comment": "Used to open writable QCOW2 images during drive patch"
+            },
+            {
+                "syscall": "ftruncate",
+                "comment": "Used to grow writable QCOW2 images"
             },
             {
                 "syscall": "epoll_ctl"
@@ -1872,6 +1887,9 @@
             },
             {
                 "syscall": "fsync"
+            },
+            {
+                "syscall": "flock"
             },
             {
                 "syscall": "fallocate",
