@@ -12,6 +12,7 @@ import pytest
 
 from framework.artifacts import GUEST_KERNELS_5_10, pin_guest_kernel
 from framework.utils import check_output, get_threads
+from host_tools.cargo_build import run_seccompiler_bin
 
 pytestmark = [
     pin_guest_kernel(GUEST_KERNELS_5_10[:1]),
@@ -194,6 +195,57 @@ def test_qcow2_live_truncation(uvm, num_queues):
             " | sha256sum"
         )
         assert stdout.split()[0] == _digest(bytes(512))
+
+
+def test_qcow2_snapshot_sync_failure(uvm, num_queues):
+    """A failed disk sync rejects snapshots without losing the paused device or its data."""
+    filter_path = Path(uvm.fsfiles) / "sync-error.json"
+    filter_path.write_text(
+        json.dumps(
+            {
+                thread: {
+                    "default_action": "allow",
+                    "filter_action": {"errno": 5},
+                    "filter": [{"syscall": "fsync"}],
+                }
+                for thread in ["vmm", "api", "vcpu", "blk_worker"]
+            }
+        )
+    )
+    bpf_path = filter_path.with_suffix(".bpf")
+    run_seccompiler_bin(bpf_path=bpf_path, json_path=filter_path)
+    uvm.create_jailed_resource(bpf_path)
+    uvm.jailer.extra_args["seccomp-filter"] = bpf_path.name
+    uvm.spawn()
+    uvm.basic_config()
+    uvm.add_net_iface()
+    image, expected = _image(uvm, "sync-error")
+    uvm.add_drive(
+        "qcow2",
+        image,
+        image_format="Qcow2",
+        num_queues=num_queues,
+        cache_type="Writeback",
+    )
+    uvm.start()
+    _assert_queue_mode(uvm, num_queues)
+    for attempt in range(2):
+        _write_pattern(
+            uvm, expected, (6 + attempt) * CLUSTER_SIZE + 512, 4096, 23, flush=False
+        )
+        uvm.pause()
+        with pytest.raises(RuntimeError, match="QCOW2.*flush|QCOW2.*sync"):
+            uvm.api.snapshot_create.put(
+                mem_file_path="failed_mem",
+                snapshot_path="failed_state",
+                snapshot_type="Full",
+                sync_snapshot_files=False,
+            )
+        assert not (Path(uvm.chroot()) / "failed_state").exists()
+        uvm.resume()
+        _assert_guest_data(uvm, expected)
+    uvm.kill()
+    _check_closed_image(image, expected)
 
 
 @pytest.mark.parametrize("cache_type", ["Unsafe", "Writeback"])

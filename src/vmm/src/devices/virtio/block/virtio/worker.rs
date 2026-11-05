@@ -296,7 +296,7 @@ impl BlockWorker {
 
     /// Prepare device for being snapshotted.
     pub(crate) fn prepare_save(&mut self, flush_mode: FlushMode) -> Result<(), BlockIoError> {
-        // Fsync errors are non-fatal; metadata must be written before saving state.
+        // Preserve legacy raw fsync handling; QCOW2 must also finish syncing its metadata.
         let result = match flush_mode {
             FlushMode::Drain => self.resources.disk.file_engine.drain(false),
             FlushMode::DrainAndFlush => self.resources.disk.file_engine.drain_and_flush(false),
@@ -312,12 +312,7 @@ impl BlockWorker {
             Err(BlockIoError::Vmdk(super::io::VmdkIoError::Flush(err))) => {
                 error!("Failed to flush block data for snapshot: {:?}", err);
             }
-            Err(BlockIoError::Qcow2(super::io::Qcow2IoError::Flush(err))) => {
-                error!("Failed to flush block data for snapshot: {:?}", err);
-            }
-            Err(err @ BlockIoError::Qcow2(super::io::Qcow2IoError::MetadataFlush(_))) => {
-                return Err(err);
-            }
+            Err(err @ BlockIoError::Qcow2(_)) => return Err(err),
             Err(err) => panic!("Failed to drain block IO engine for snapshot: {err:?}"),
         }
         if matches!(&self.resources.disk.file_engine, FileEngine::Async(_)) {
@@ -833,85 +828,76 @@ mod tests {
                     })
                     .collect();
                 apply_filter(&filter).unwrap();
-                if fail_syscall == libc::SYS_fsync {
-                    let err = worker
-                        .resources
-                        .disk
-                        .file_engine
-                        .drain_and_flush(false)
-                        .unwrap_err();
-                    assert!(matches!(
-                        err,
-                        BlockIoError::Qcow2(Qcow2IoError::Flush(err))
-                            if err.raw_os_error() == Some(libc::EIO)
-                    ));
-                    worker.prepare_save(FlushMode::DrainAndFlush).unwrap();
-                    worker.prepare_save(FlushMode::Drain).unwrap();
-                    None
-                } else {
-                    let err = worker.prepare_save(FlushMode::DrainAndFlush).unwrap_err();
-                    assert!(matches!(
-                        err,
-                        BlockIoError::Qcow2(Qcow2IoError::MetadataFlush(err))
-                            if err.raw_os_error() == Some(libc::EIO)
-                    ));
-                    let mem = worker.active_state.mem.clone();
-                    let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
-                    worker.resources.queue = vq.create_queue();
-                    worker.resources.queue.initialize(&mem).unwrap();
-                    let handle = WorkerHandle::spawn(
-                        Arc::new(vec![]),
-                        worker.resources.queue_evt.try_clone().unwrap(),
-                        "fc_qcow2_flush".into(),
-                    )
-                    .unwrap();
-                    handle.start(worker);
-                    for _ in 0..2 {
-                        let err = handle.pause(FlushMode::DrainAndFlush).unwrap_err();
-                        assert!(matches!(
-                            err,
-                            BlockIoError::Qcow2(Qcow2IoError::MetadataFlush(err))
-                                if err.raw_os_error() == Some(libc::EIO)
-                        ));
-                        handle.get_queue_state();
+                let err = worker.prepare_save(FlushMode::DrainAndFlush).unwrap_err();
+                match err {
+                    BlockIoError::Qcow2(Qcow2IoError::Flush(err)) => {
+                        assert_eq!(fail_syscall, libc::SYS_fsync);
+                        assert_eq!(err.raw_os_error(), Some(libc::EIO));
                     }
-                    read_blk_req_descriptors(&vq);
-                    vq.dtable[1].len.set(VIRTIO_BLK_ID_BYTES);
-                    let request_type_addr = GuestAddress(vq.dtable[0].addr.get());
-                    let status_addr = GuestAddress(vq.dtable[2].addr.get());
-                    mem.write_obj::<u32>(VIRTIO_BLK_T_GET_ID, request_type_addr)
-                        .unwrap();
-                    handle.kick(true);
+                    BlockIoError::Qcow2(Qcow2IoError::MetadataFlush(err)) => {
+                        assert_eq!(fail_syscall, libc::SYS_pwritev);
+                        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+                    }
+                    err => panic!("Unexpected snapshot error: {err:?}"),
+                }
+                if fail_syscall == libc::SYS_fsync {
+                    worker.prepare_save(FlushMode::Drain).unwrap();
+                }
+                let mem = worker.active_state.mem.clone();
+                let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+                worker.resources.queue = vq.create_queue();
+                worker.resources.queue.initialize(&mem).unwrap();
+                let handle = WorkerHandle::spawn(
+                    Arc::new(vec![]),
+                    worker.resources.queue_evt.try_clone().unwrap(),
+                    "fc_qcow2_flush".into(),
+                )
+                .unwrap();
+                handle.start(worker);
+                for _ in 0..2 {
                     let err = handle.pause(FlushMode::DrainAndFlush).unwrap_err();
                     assert!(matches!(
                         err,
-                        BlockIoError::Qcow2(Qcow2IoError::MetadataFlush(err))
+                        BlockIoError::Qcow2(Qcow2IoError::Flush(err) | Qcow2IoError::MetadataFlush(err))
                             if err.raw_os_error() == Some(libc::EIO)
                     ));
-                    assert_eq!(vq.used.idx.get(), 1);
-                    assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), VIRTIO_BLK_S_OK);
-                    let resources = handle.reset();
-                    handle.finish(FlushMode::Drain);
-                    Some((resources, mem, file))
+                    handle.get_queue_state();
                 }
+                read_blk_req_descriptors(&vq);
+                vq.dtable[1].len.set(VIRTIO_BLK_ID_BYTES);
+                let request_type_addr = GuestAddress(vq.dtable[0].addr.get());
+                let status_addr = GuestAddress(vq.dtable[2].addr.get());
+                mem.write_obj::<u32>(VIRTIO_BLK_T_GET_ID, request_type_addr)
+                    .unwrap();
+                handle.kick(true);
+                let err = handle.pause(FlushMode::DrainAndFlush).unwrap_err();
+                assert!(matches!(
+                    err,
+                    BlockIoError::Qcow2(Qcow2IoError::Flush(err) | Qcow2IoError::MetadataFlush(err))
+                        if err.raw_os_error() == Some(libc::EIO)
+                ));
+                assert_eq!(vq.used.idx.get(), 1);
+                assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), VIRTIO_BLK_S_OK);
+                let resources = handle.reset();
+                handle.finish(FlushMode::Drain);
+                (resources, mem, file)
             })
             .join()
             .unwrap();
-            if let Some((resources, mem, _file)) = retry {
-                let block = default_block(FileEngineType::Sync);
-                let mut worker = BlockWorker {
-                    resources,
-                    active_state: ActiveState {
-                        mem,
-                        interrupt: default_interrupt(),
-                    },
-                    rate_limiter: block.rate_limiter.clone(),
-                    is_blocked: block.lock_rate_limiter().clone_blocked_flag(),
-                    discard_supported: false,
-                    metrics: block.metrics.clone(),
-                };
-                worker.prepare_save(FlushMode::DrainAndFlush).unwrap();
-            }
+            let (resources, mem, _file) = retry;
+            let block = default_block(FileEngineType::Sync);
+            let mut worker = BlockWorker {
+                resources,
+                active_state: ActiveState {
+                    mem,
+                    interrupt: default_interrupt(),
+                },
+                rate_limiter: block.rate_limiter.clone(),
+                is_blocked: block.lock_rate_limiter().clone_blocked_flag(),
+                discard_supported: false,
+                metrics: block.metrics.clone(),
+            };
+            worker.prepare_save(FlushMode::DrainAndFlush).unwrap();
         }
     }
 
