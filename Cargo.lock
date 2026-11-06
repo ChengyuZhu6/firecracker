@@ -751,7 +751,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 [[package]]
 name = "imago"
 version = "0.2.6"
-source = "git+https://github.com/ChengyuZhu6/imago.git?rev=f446c98bf0296296a6be99e54e5a2d3a70523d6f#f446c98bf0296296a6be99e54e5a2d3a70523d6f"
+source = "git+https://github.com/ChengyuZhu6/imago.git?rev=d6a40eb5c21e963131a1b439facf252480d5d57e#d6a40eb5c21e963131a1b439facf252480d5d57e"
 dependencies = [
  "cfg-if",
  "libc",
