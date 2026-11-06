@@ -16,7 +16,7 @@ default-members = [
 resolver = "2"
 
 [patch.crates-io]
-imago = { git = "https://github.com/ChengyuZhu6/imago.git", rev = "5c19b15bdb17b02096058224bd91547a44149723" }
+imago = { git = "https://github.com/ChengyuZhu6/imago.git", rev = "f446c98bf0296296a6be99e54e5a2d3a70523d6f" }
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"

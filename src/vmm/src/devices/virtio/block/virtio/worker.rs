@@ -849,7 +849,7 @@ mod tests {
                         assert_eq!(err.raw_os_error(), Some(libc::EIO));
                     }
                     BlockIoError::Qcow2(Qcow2IoError::MetadataFlush(err)) => {
-                        assert_eq!(fail_syscall, libc::SYS_pwritev);
+                        // Metadata dependency barriers may also fail fsync before the final sync.
                         assert_eq!(err.raw_os_error(), Some(libc::EIO));
                     }
                     err => panic!("Unexpected snapshot error: {err:?}"),
