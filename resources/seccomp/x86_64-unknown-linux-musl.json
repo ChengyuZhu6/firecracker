@@ -54,7 +54,28 @@
                 "syscall": "fsync"
             },
             {
-                "syscall": "flock"
+                "syscall": "flock",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 5,
+                        "comment": "LOCK_SH | LOCK_NB for read-only QCOW2 images"
+                    }
+                ]
+            },
+            {
+                "syscall": "flock",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 6,
+                        "comment": "LOCK_EX | LOCK_NB for writable QCOW2 images"
+                    }
+                ]
             },
             {
                 "syscall": "fallocate",
@@ -1889,7 +1910,28 @@
                 "syscall": "fsync"
             },
             {
-                "syscall": "flock"
+                "syscall": "flock",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 5,
+                        "comment": "LOCK_SH | LOCK_NB for read-only QCOW2 images"
+                    }
+                ]
+            },
+            {
+                "syscall": "flock",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 6,
+                        "comment": "LOCK_EX | LOCK_NB for writable QCOW2 images"
+                    }
+                ]
             },
             {
                 "syscall": "fallocate",
