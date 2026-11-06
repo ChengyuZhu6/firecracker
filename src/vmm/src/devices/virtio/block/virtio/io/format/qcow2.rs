@@ -161,6 +161,9 @@ impl Qcow2FileEngine {
     }
 
     pub fn flush(&self) -> Result<(), Qcow2IoError> {
+        if !self.access.inner().writable() {
+            return Ok(());
+        }
         self.access.flush().map_err(Qcow2IoError::MetadataFlush)?;
         self.access.sync().map_err(Qcow2IoError::Flush)
     }

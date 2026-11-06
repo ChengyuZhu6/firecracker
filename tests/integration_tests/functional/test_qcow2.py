@@ -10,7 +10,13 @@ from pathlib import Path
 import pytest
 
 from framework.artifacts import GUEST_KERNELS_5_10, pin_guest_kernel
-from framework.utils import check_output, get_threads
+from framework.utils import check_output, get_threads, run_cmd
+from framework.utils_vsock import (
+    ECHO_SERVER_PORT,
+    VSOCK_UDS_PATH,
+    start_guest_echo_server,
+    vsock_connect_to_guest,
+)
 from host_tools.cargo_build import run_seccompiler_bin
 
 pytestmark = pin_guest_kernel(GUEST_KERNELS_5_10[:1])
@@ -193,6 +199,37 @@ def test_qcow2_live_truncation(uvm, num_queues):
         assert stdout.split()[0] == _digest(bytes(512))
 
 
+def test_qcow2_unclean_shutdown(uvm, num_queues):
+    """Published L2 tables retain their refcounts after Firecracker is killed."""
+    image = Path(uvm.fsfiles) / "unclean.qcow2"
+    check_output(
+        [
+            "qemu-img",
+            "create",
+            "-f",
+            "qcow2",
+            "-o",
+            "cluster_size=512",
+            str(image),
+            "4M",
+        ]
+    )
+    uvm.spawn()
+    uvm.basic_config()
+    uvm.add_net_iface()
+    uvm.add_drive("qcow2", image, image_format="Qcow2", num_queues=num_queues)
+    uvm.start()
+    expected = bytearray(DISK_SIZE)
+    for offset in (512, 2 * 1024 * 1024 - 512, 3 * 1024 * 1024):
+        _write_pattern(uvm, expected, offset, 65536, 73, flush=False)
+    uvm.kill()
+
+    result = run_cmd(["qemu-img", "check", "-f", "qcow2", "--output=json", str(image)])
+    # Unflushed writes can leak clusters, but must not publish unowned metadata.
+    assert result.returncode in (0, 3), (result.stdout, result.stderr)
+    assert json.loads(result.stdout).get("corruptions", 0) == 0
+
+
 def test_qcow2_snapshot_sync_failure(uvm, num_queues):
     """A failed disk sync rejects snapshots without losing the paused device or its data."""
     filter_path = Path(uvm.fsfiles) / "sync-error.json"
@@ -223,23 +260,31 @@ def test_qcow2_snapshot_sync_failure(uvm, num_queues):
         num_queues=num_queues,
         cache_type="Writeback",
     )
+    uvm.api.vsock.put(vsock_id="vsock0", guest_cid=3, uds_path="/" + VSOCK_UDS_PATH)
     uvm.start()
     _assert_queue_mode(uvm, num_queues)
-    for attempt in range(2):
-        _write_pattern(
-            uvm, expected, (6 + attempt) * CLUSTER_SIZE + 512, 4096, 23, flush=False
-        )
-        uvm.pause()
-        with pytest.raises(RuntimeError, match="QCOW2.*flush|QCOW2.*sync"):
-            uvm.api.snapshot_create.put(
-                mem_file_path="failed_mem",
-                snapshot_path="failed_state",
-                snapshot_type="Full",
-                sync_snapshot_files=False,
+    uds_path = start_guest_echo_server(uvm)
+    with vsock_connect_to_guest(uds_path, ECHO_SERVER_PORT) as connection:
+        connection.settimeout(5)
+        connection.sendall(b"x")
+        assert connection.recv(1) == b"x"
+        for attempt in range(2):
+            _write_pattern(
+                uvm, expected, (6 + attempt) * CLUSTER_SIZE + 512, 4096, 23, flush=False
             )
-        assert not (Path(uvm.chroot()) / "failed_state").exists()
-        uvm.resume()
-        _assert_guest_data(uvm, expected)
+            uvm.pause()
+            with pytest.raises(RuntimeError, match="QCOW2.*flush|QCOW2.*sync"):
+                uvm.api.snapshot_create.put(
+                    mem_file_path="failed_mem",
+                    snapshot_path="failed_state",
+                    snapshot_type="Full",
+                    sync_snapshot_files=False,
+                )
+            assert not (Path(uvm.chroot()) / "failed_state").exists()
+            uvm.resume()
+            _assert_guest_data(uvm, expected)
+            connection.sendall(b"x")
+            assert connection.recv(1) == b"x"
     uvm.kill()
     _check_closed_image(image, expected)
 

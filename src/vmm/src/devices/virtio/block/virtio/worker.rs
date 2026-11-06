@@ -827,7 +827,21 @@ mod tests {
                         u64::from_ne_bytes([code[0], code[1], jt, jf, k[0], k[1], k[2], k[3]])
                     })
                     .collect();
+                let read_only_file = create_test_qcow2();
+                let read_only_disk = DiskProperties::new(
+                    read_only_file.as_path().to_str().unwrap(),
+                    true,
+                    FileEngineType::Sync,
+                    DiskImageFormat::Qcow2,
+                )
+                .unwrap();
+                let FileEngine::Qcow2(read_only_engine) = &read_only_disk.file_engine else {
+                    unreachable!();
+                };
                 apply_filter(&filter).unwrap();
+                // Read-only images may live on filesystems without fsync support.
+                read_only_engine.flush().unwrap();
+
                 let err = worker.prepare_save(FlushMode::DrainAndFlush).unwrap_err();
                 match err {
                     BlockIoError::Qcow2(Qcow2IoError::Flush(err)) => {
