@@ -1160,9 +1160,10 @@ impl VirtioDevice for VirtioBlock {
 
 impl Drop for VirtioBlock {
     fn drop(&mut self) {
-        let flush_mode = match self.config.cache_type {
-            CacheType::Unsafe => FlushMode::Drain,
-            CacheType::Writeback => FlushMode::DrainAndFlush,
+        let flush_mode = match (self.config.image_format, self.config.cache_type) {
+            // Even with Unsafe caching, dropping QCOW2 must publish its in-memory mappings.
+            (DiskImageFormat::Qcow2, _) | (_, CacheType::Writeback) => FlushMode::DrainAndFlush,
+            (_, CacheType::Unsafe) => FlushMode::Drain,
         };
 
         match std::mem::replace(&mut self.state, BlockRuntimeState::Placeholder) {
@@ -2864,38 +2865,50 @@ mod tests {
     }
 
     #[test]
-    fn test_qcow2_snapshot_flushes_parked_engine() {
+    fn test_qcow2_persists_parked_engine_on_snapshot_and_drop() {
         use crate::devices::virtio::block::virtio::io::format::qcow2::tests::create_test_qcow2;
         use crate::devices::virtio::block::virtio::test_utils::default_config;
 
-        let file = create_test_qcow2();
-        let path = file.as_path().to_str().unwrap();
-        let mut config = default_config(path.to_string(), FileEngineType::Sync);
-        config.image_format = DiskImageFormat::Qcow2;
-        let mut block = VirtioBlock::new(config).unwrap();
+        for snapshot in [false, true] {
+            let file = create_test_qcow2();
+            let path = file.as_path().to_str().unwrap();
+            let mut config = default_config(path.to_string(), FileEngineType::Sync);
+            config.image_format = DiskImageFormat::Qcow2;
+            let mut block = VirtioBlock::new(config).unwrap();
 
-        let mem = default_mem();
-        let addr = GuestAddress(0);
-        let pattern = [0x6d; 512];
-        mem.write_slice(&pattern, addr).unwrap();
-        let BlockRuntimeState::Configuring(resources, _) = &mut block.state else {
-            unreachable!();
-        };
-        let FileEngine::Qcow2(engine) = &mut resources[0].disk.file_engine else {
-            unreachable!();
-        };
-        engine.write(0, &mem, addr, 512).unwrap();
+            let mem = default_mem();
+            let addr = GuestAddress(0);
+            let pattern = [0x6d; 512];
+            mem.write_slice(&pattern, addr).unwrap();
+            let BlockRuntimeState::Configuring(resources, _) = &mut block.state else {
+                unreachable!();
+            };
+            let FileEngine::Qcow2(engine) = &mut resources[0].disk.file_engine else {
+                unreachable!();
+            };
+            engine.write(0, &mem, addr, 512).unwrap();
 
-        block.prepare_save().unwrap();
-        drop(block);
-        let mut reader =
-            block_io::Qcow2FileEngine::from_file(File::open(path).unwrap(), file.as_path(), true)
-                .unwrap();
-        mem.write_slice(&[0; 512], addr).unwrap();
-        reader.read(0, &mem, addr, 512).unwrap();
-        let mut actual = [0; 512];
-        mem.read_slice(&mut actual, addr).unwrap();
-        assert_eq!(actual, pattern);
+            let persisted = if snapshot {
+                block.prepare_save().unwrap();
+                let copy = TempFile::new().unwrap();
+                std::fs::copy(file.as_path(), copy.as_path()).unwrap();
+                copy
+            } else {
+                drop(block);
+                file
+            };
+            let mut reader = block_io::Qcow2FileEngine::from_file(
+                File::open(persisted.as_path()).unwrap(),
+                persisted.as_path(),
+                true,
+            )
+            .unwrap();
+            mem.write_slice(&[0; 512], addr).unwrap();
+            reader.read(0, &mem, addr, 512).unwrap();
+            let mut actual = [0; 512];
+            mem.read_slice(&mut actual, addr).unwrap();
+            assert_eq!(actual, pattern);
+        }
     }
 
     #[test]
