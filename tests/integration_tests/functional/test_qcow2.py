@@ -5,7 +5,6 @@
 import hashlib
 import json
 import os
-import shutil
 from pathlib import Path
 
 import pytest
@@ -14,10 +13,7 @@ from framework.artifacts import GUEST_KERNELS_5_10, pin_guest_kernel
 from framework.utils import check_output, get_threads
 from host_tools.cargo_build import run_seccompiler_bin
 
-pytestmark = [
-    pin_guest_kernel(GUEST_KERNELS_5_10[:1]),
-    pytest.mark.skipif(shutil.which("qemu-img") is None, reason="qemu-img is required"),
-]
+pytestmark = pin_guest_kernel(GUEST_KERNELS_5_10[:1])
 
 CLUSTER_SIZE = 64 * 1024
 DISK_SIZE = 4 * 1024 * 1024
