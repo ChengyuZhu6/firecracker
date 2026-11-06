@@ -319,6 +319,21 @@ def test_qcow2_patch_dirty_image(uvm, num_queues):
     os.link(original, alias)
     invalid = Path(uvm.fsfiles) / "invalid.qcow2"
     invalid.write_bytes(b"not a QCOW2 image" * 256)
+    malformed, _ = _image(uvm, "short-l1")
+    malformed_data = bytearray(malformed.read_bytes())
+    l1_size = int.from_bytes(malformed_data[36:40], "big")
+    malformed_data[24:32] = (l1_size * CLUSTER_SIZE**2 // 8 + 512).to_bytes(8, "big")
+    malformed_data[88:96] = (1 << 63).to_bytes(8, "big")
+    malformed.write_bytes(malformed_data)
+    for read_only in [False, True]:
+        with pytest.raises(RuntimeError, match="L1 table"):
+            uvm.add_drive(
+                "malformed",
+                malformed,
+                image_format="Qcow2",
+                is_read_only=read_only,
+            )
+        assert malformed.read_bytes() == malformed_data
     uvm.add_drive(
         "qcow2",
         original,
@@ -335,11 +350,13 @@ def test_qcow2_patch_dirty_image(uvm, num_queues):
     assert get_threads(uvm.firecracker_pid).get("fc_q0_qcow2") == threads
     _assert_guest_data(uvm, original_data)
 
-    with pytest.raises(RuntimeError, match="QCOW2|qcow2"):
-        uvm.api.drive.patch(
-            drive_id="qcow2", path_on_host=uvm.create_jailed_resource(invalid)
-        )
-    _assert_guest_data(uvm, original_data)
+    for rejected in [invalid, malformed]:
+        with pytest.raises(RuntimeError, match="QCOW2|qcow2"):
+            uvm.api.drive.patch(
+                drive_id="qcow2", path_on_host=uvm.create_jailed_resource(rejected)
+            )
+        _assert_guest_data(uvm, original_data)
+    assert malformed.read_bytes() == malformed_data
     _write_pattern(uvm, original_data, 10 * CLUSTER_SIZE - 512, 8192, 41, flush=False)
     uvm.api.drive.patch(
         drive_id="qcow2", path_on_host=uvm.create_jailed_resource(replacement)
