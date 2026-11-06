@@ -17,11 +17,13 @@ use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::balloon::persist::BalloonConstructorArgs;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::block::persist::BlockConstructorArgs;
+use crate::devices::virtio::block::virtio::device::DiskImageFormat;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceId, VirtioDeviceType};
 use crate::devices::virtio::mem::VirtioMem;
 use crate::devices::virtio::mem::persist::VirtioMemConstructorArgs;
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::net::persist::NetConstructorArgs;
+use crate::devices::virtio::persist::PersistError;
 use crate::devices::virtio::pmem::device::Pmem;
 use crate::devices::virtio::pmem::persist::PmemConstructorArgs;
 use crate::devices::virtio::rng::Entropy;
@@ -210,6 +212,24 @@ impl PciDevices {
         use acpi_tables::Aml;
 
         self.pci_segment().append_aml_bytes(dsdt_data)
+    }
+
+    /// Flush writable QCOW2 data before completing an acknowledged removal.
+    pub(crate) fn prepare_qcow2_unplug(
+        &self,
+        device_id: &VirtioDeviceId,
+    ) -> Result<(), PersistError> {
+        let device = self
+            .get_device(device_id.0, &device_id.1)
+            .expect("device presence should be checked before unplug");
+        let mut device = device.lock().expect("Poisoned lock");
+        if let Some(Block::Virtio(block)) = device.as_mut_any().downcast_mut::<Block>()
+            && block.config.image_format == DiskImageFormat::Qcow2
+            && !block.config.is_read_only
+        {
+            block.prepare_save()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn detach_pci_virtio_device(
