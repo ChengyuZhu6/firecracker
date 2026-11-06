@@ -14,7 +14,7 @@ use std::num::NonZeroU16;
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::os::linux::fs::MetadataExt;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use vm_memory::ByteValued;
@@ -67,10 +67,18 @@ pub struct DiskProperties {
 
 impl DiskProperties {
     // Helper function that opens the file with the proper access permissions
-    fn open_file(disk_image_path: &str, is_disk_read_only: bool) -> Result<File, VirtioBlockError> {
-        OpenOptions::new()
-            .read(true)
-            .write(!is_disk_read_only)
+    fn open_file(
+        disk_image_path: &str,
+        is_disk_read_only: bool,
+        image_format: DiskImageFormat,
+    ) -> Result<File, VirtioBlockError> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(!is_disk_read_only);
+        if image_format == DiskImageFormat::Qcow2 {
+            // A FIFO must not block before we can check the opened file's type.
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        options
             .open(PathBuf::from(&disk_image_path))
             .map_err(|x| VirtioBlockError::BackingFile(x, disk_image_path.to_string()))
     }
@@ -162,7 +170,7 @@ impl DiskProperties {
         file_engine_type: FileEngineType,
         image_format: DiskImageFormat,
     ) -> Result<Self, VirtioBlockError> {
-        let disk_image = Self::open_file(disk_image_path, is_disk_read_only)?;
+        let disk_image = Self::open_file(disk_image_path, is_disk_read_only, image_format)?;
         let image_id = Self::build_disk_image_id(&disk_image);
         let (file_engine, disk_size) = Self::from_disk_image(
             disk_image_path,
@@ -185,26 +193,28 @@ impl DiskProperties {
         disk_image_path: String,
         is_disk_read_only: bool,
     ) -> Result<(), VirtioBlockError> {
-        let mut disk_image = Self::open_file(&disk_image_path, is_disk_read_only)?;
+        let image_format = DiskImageFormat::from(&self.file_engine);
+        let mut disk_image = Self::open_file(&disk_image_path, is_disk_read_only, image_format)?;
         let image_id = Self::build_disk_image_id(&disk_image);
-        if let FileEngine::Qcow2(engine) = &self.file_engine
-            && engine
+        if let FileEngine::Qcow2(engine) = &self.file_engine {
+            let same_file = engine
                 .same_file(&disk_image)
-                .map_err(|err| VirtioBlockError::BackingFile(err, disk_image_path.clone()))?
-        {
+                .map_err(|err| VirtioBlockError::BackingFile(err, disk_image_path.clone()))?;
+            // Finish persisting the old image before opening a writable replacement.
             engine
                 .flush()
                 .map_err(block_io::BlockIoError::Qcow2)
                 .map_err(VirtioBlockError::FileEngine)?;
-            self.image_id = image_id;
-            return Ok(());
+            if same_file {
+                self.image_id = image_id;
+                return Ok(());
+            }
         }
 
         // A raw image is a single file the engine can be pointed at. Formatted images
         // are parsed into engine state when they are opened (for VMDK: the descriptor
         // and its extents), and their size comes from that state rather than from the
         // size of the descriptor file, so the engine has to be rebuilt instead.
-        let image_format = DiskImageFormat::from(&self.file_engine);
         let disk_size = if image_format == DiskImageFormat::Raw {
             let disk_size = Self::file_size(&disk_image_path, &mut disk_image)?;
             self.file_engine
@@ -219,12 +229,6 @@ impl DiskProperties {
                 self.file_engine_type(),
                 image_format,
             )?;
-            if let FileEngine::Qcow2(engine) = &self.file_engine {
-                engine
-                    .flush()
-                    .map_err(block_io::BlockIoError::Qcow2)
-                    .map_err(VirtioBlockError::FileEngine)?;
-            }
             self.file_engine = file_engine;
             disk_size
         };
@@ -843,7 +847,15 @@ impl VirtioBlock {
                 last.pause(FlushMode::DrainAndFlush)
                     .map_err(crate::devices::virtio::persist::PersistError::BlockIo)
             }
-            BlockRuntimeState::Configuring(_, _) => Ok(()),
+            BlockRuntimeState::Configuring(resources, _) => {
+                // Reset parks the engine with any pending QCOW2 metadata still in memory.
+                for resource in resources {
+                    if let FileEngine::Qcow2(engine) = &resource.disk.file_engine {
+                        engine.flush().map_err(block_io::BlockIoError::Qcow2)?;
+                    }
+                }
+                Ok(())
+            }
             BlockRuntimeState::Placeholder => unreachable!("not a runtime state"),
         }
     }
@@ -2826,6 +2838,64 @@ mod tests {
         block.activate(mem, default_interrupt()).unwrap();
 
         block.reset();
+    }
+
+    #[test]
+    fn test_qcow2_rejects_non_regular_files() {
+        use std::ffi::CString;
+        use vmm_sys_util::tempdir::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.as_path().join("disk.qcow2");
+        let filename = CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: filename is a valid, NUL-terminated pathname.
+        assert_eq!(unsafe { libc::mkfifo(filename.as_ptr(), 0o600) }, 0);
+        assert!(matches!(
+            DiskProperties::new(
+                fifo.to_str().unwrap(),
+                true,
+                FileEngineType::Sync,
+                DiskImageFormat::Qcow2,
+            ),
+            Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
+                block_io::Qcow2IoError::Open(err)
+            ))) if err.kind() == std::io::ErrorKind::InvalidInput
+        ));
+    }
+
+    #[test]
+    fn test_qcow2_snapshot_flushes_parked_engine() {
+        use crate::devices::virtio::block::virtio::io::format::qcow2::tests::create_test_qcow2;
+        use crate::devices::virtio::block::virtio::test_utils::default_config;
+
+        let file = create_test_qcow2();
+        let path = file.as_path().to_str().unwrap();
+        let mut config = default_config(path.to_string(), FileEngineType::Sync);
+        config.image_format = DiskImageFormat::Qcow2;
+        let mut block = VirtioBlock::new(config).unwrap();
+
+        let mem = default_mem();
+        let addr = GuestAddress(0);
+        let pattern = [0x6d; 512];
+        mem.write_slice(&pattern, addr).unwrap();
+        let BlockRuntimeState::Configuring(resources, _) = &mut block.state else {
+            unreachable!();
+        };
+        let FileEngine::Qcow2(engine) = &mut resources[0].disk.file_engine else {
+            unreachable!();
+        };
+        engine.write(0, &mem, addr, 512).unwrap();
+
+        block.prepare_save().unwrap();
+        drop(block);
+        let mut reader =
+            block_io::Qcow2FileEngine::from_file(File::open(path).unwrap(), file.as_path(), true)
+                .unwrap();
+        mem.write_slice(&[0; 512], addr).unwrap();
+        reader.read(0, &mem, addr, 512).unwrap();
+        let mut actual = [0; 512];
+        mem.read_slice(&mut actual, addr).unwrap();
+        assert_eq!(actual, pattern);
     }
 
     #[test]

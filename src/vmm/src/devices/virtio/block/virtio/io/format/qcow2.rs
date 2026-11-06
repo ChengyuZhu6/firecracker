@@ -53,6 +53,12 @@ pub struct Qcow2FileEngine {
 impl Qcow2FileEngine {
     pub fn from_file(file: File, path: &Path, read_only: bool) -> Result<Self, Qcow2IoError> {
         let metadata = file.metadata().map_err(Qcow2IoError::Open)?;
+        if !metadata.is_file() {
+            return Err(Qcow2IoError::Open(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "QCOW2 image must be a regular file",
+            )));
+        }
         if read_only {
             file.try_lock_shared()
         } else {
