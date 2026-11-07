@@ -71,7 +71,7 @@ enum ControlMsg {
 enum ControlResponse {
     DiskUpdated(Result<u64, VirtioBlockError>), // returns nsectors on success
     Reset(BlockResources),
-    Paused,
+    Paused(Result<(), BlockIoError>),
     QueueState(QueueState),
     DirtyCommitted,
 }
@@ -97,7 +97,7 @@ macro_rules! unwrap_async_file_engine_or_return {
     ($file_engine: expr) => {
         match $file_engine {
             FileEngine::Async(engine) => engine,
-            FileEngine::Sync(_) | FileEngine::Vmdk(_) => {
+            FileEngine::Sync(_) | FileEngine::Vmdk(_) | FileEngine::Qcow2(_) => {
                 error!("The block device doesn't use an async IO engine");
                 return;
             }
@@ -295,8 +295,8 @@ impl BlockWorker {
     }
 
     /// Prepare device for being snapshotted.
-    pub(crate) fn prepare_save(&mut self, flush_mode: FlushMode) {
-        // Fsync errors are non-fatal; other drain errors are broken invariants.
+    pub(crate) fn prepare_save(&mut self, flush_mode: FlushMode) -> Result<(), BlockIoError> {
+        // Preserve legacy raw fsync handling; QCOW2 must also finish syncing its metadata.
         let result = match flush_mode {
             FlushMode::Drain => self.resources.disk.file_engine.drain(false),
             FlushMode::DrainAndFlush => self.resources.disk.file_engine.drain_and_flush(false),
@@ -312,11 +312,13 @@ impl BlockWorker {
             Err(BlockIoError::Vmdk(super::io::VmdkIoError::Flush(err))) => {
                 error!("Failed to flush block data for snapshot: {:?}", err);
             }
+            Err(err @ BlockIoError::Qcow2(_)) => return Err(err),
             Err(err) => panic!("Failed to drain block IO engine for snapshot: {err:?}"),
         }
         if matches!(&self.resources.disk.file_engine, FileEngine::Async(_)) {
             self.process_async_completion_queue();
         }
+        Ok(())
     }
 
     /// Update the backing file and return the new sector count.
@@ -419,9 +421,9 @@ impl WorkerHandle {
     }
 
     /// Pause data-path processing after completing pending I/O.
-    pub(crate) fn pause(&self, flush_mode: FlushMode) {
+    pub(crate) fn pause(&self, flush_mode: FlushMode) -> Result<(), BlockIoError> {
         match self.request_response(ControlMsg::Pause(flush_mode)) {
-            ControlResponse::Paused => {}
+            ControlResponse::Paused(result) => result,
             response => panic!("Unexpected block worker pause response: {response:?}"),
         }
     }
@@ -589,22 +591,21 @@ impl ThreadedWorker {
     }
 
     fn pause_worker(&mut self, flush_mode: FlushMode, ops: &mut EventOps) {
-        match std::mem::replace(&mut self.state, WorkerState::Parked) {
-            WorkerState::Running(mut worker) => {
+        let mut worker = match std::mem::replace(&mut self.state, WorkerState::Parked) {
+            WorkerState::Running(worker) => {
                 Self::unregister_runtime_events(&worker.resources, ops);
-                worker.prepare_save(flush_mode);
-                self.state = WorkerState::Paused(worker);
+                worker
             }
-            WorkerState::Paused(worker) => {
-                self.state = WorkerState::Paused(worker);
-            }
+            WorkerState::Paused(worker) => worker,
             state => {
                 self.state = state;
                 panic!("Pause requested while block worker is not active")
             }
-        }
+        };
 
-        self.reply(ControlResponse::Paused);
+        let result = worker.prepare_save(flush_mode);
+        self.state = WorkerState::Paused(worker);
+        self.reply(ControlResponse::Paused(result));
     }
 
     fn send_queue_state(&self) {
@@ -752,10 +753,160 @@ mod tests {
         VIRTIO_BLK_ID_BYTES, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_GET_ID,
     };
     use crate::devices::virtio::block::virtio::test_utils::{
-        default_block, read_blk_req_descriptors, set_queue,
+        default_block, read_blk_req_descriptors, set_queue, syscall_eio_filter,
     };
     use crate::devices::virtio::test_utils::{VirtQueue, default_interrupt, default_mem};
     use crate::vstate::memory::{Bytes, GuestAddress};
+
+    #[test]
+    fn test_qcow2_snapshot_flush_error() {
+        use crate::devices::virtio::block::virtio::device::{DiskImageFormat, DiskProperties};
+        use crate::devices::virtio::block::virtio::io::Qcow2IoError;
+        use crate::devices::virtio::block::virtio::test_utils::create_test_qcow2;
+
+        for fail_syscall in [libc::SYS_fsync, libc::SYS_pwritev] {
+            let retry = thread::spawn(move || {
+                let file = create_test_qcow2();
+                let mut block = default_block(FileEngineType::Sync);
+                let BlockRuntimeState::Configuring(mut resources, _) =
+                    std::mem::replace(&mut block.state, BlockRuntimeState::Placeholder)
+                else {
+                    unreachable!()
+                };
+                let mut resources = resources.pop().unwrap();
+                resources.disk = DiskProperties::new(
+                    file.as_path().to_str().unwrap(),
+                    false,
+                    FileEngineType::Sync,
+                    DiskImageFormat::Qcow2,
+                )
+                .unwrap();
+                let mut worker = BlockWorker {
+                    resources,
+                    active_state: ActiveState {
+                        mem: default_mem(),
+                        interrupt: default_interrupt(),
+                    },
+                    rate_limiter: block.rate_limiter.clone(),
+                    is_blocked: block.lock_rate_limiter().clone_blocked_flag(),
+                    discard_supported: false,
+                    metrics: block.metrics.clone(),
+                };
+                worker
+                    .active_state
+                    .mem
+                    .write_slice(&[0xa5; 512], GuestAddress(0))
+                    .unwrap();
+                let FileEngine::Qcow2(engine) = &mut worker.resources.disk.file_engine else {
+                    unreachable!()
+                };
+                engine
+                    .write(0, &worker.active_state.mem, GuestAddress(0), 512)
+                    .unwrap();
+                let read_only_file = create_test_qcow2();
+                let read_only_disk = DiskProperties::new(
+                    read_only_file.as_path().to_str().unwrap(),
+                    true,
+                    FileEngineType::Sync,
+                    DiskImageFormat::Qcow2,
+                )
+                .unwrap();
+                let FileEngine::Qcow2(read_only_engine) = &read_only_disk.file_engine else {
+                    unreachable!();
+                };
+                apply_filter(&syscall_eio_filter(fail_syscall)).unwrap();
+                // Read-only images may live on filesystems without fsync support.
+                read_only_engine.flush().unwrap();
+
+                let err = worker.prepare_save(FlushMode::DrainAndFlush).unwrap_err();
+                match err {
+                    BlockIoError::Qcow2(Qcow2IoError::Flush(err)) => {
+                        assert_eq!(fail_syscall, libc::SYS_fsync);
+                        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+                    }
+                    BlockIoError::Qcow2(Qcow2IoError::MetadataFlush(err)) => {
+                        // Metadata dependency barriers may also fail fsync before the final sync.
+                        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+                    }
+                    err => panic!("Unexpected snapshot error: {err:?}"),
+                }
+                if fail_syscall == libc::SYS_fsync {
+                    worker.prepare_save(FlushMode::Drain).unwrap();
+                }
+                let mem = worker.active_state.mem.clone();
+                let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+                worker.resources.queue = vq.create_queue();
+                worker.resources.queue.initialize(&mem).unwrap();
+                let handle = WorkerHandle::spawn(
+                    Arc::new(vec![]),
+                    worker.resources.queue_evt.try_clone().unwrap(),
+                    "fc_qcow2_flush".into(),
+                )
+                .unwrap();
+                handle.start(worker);
+                for _ in 0..2 {
+                    let err = handle.pause(FlushMode::DrainAndFlush).unwrap_err();
+                    assert!(matches!(
+                        err,
+                        BlockIoError::Qcow2(Qcow2IoError::Flush(err) | Qcow2IoError::MetadataFlush(err))
+                            if err.raw_os_error() == Some(libc::EIO)
+                    ));
+                    handle.get_queue_state();
+                }
+                read_blk_req_descriptors(&vq);
+                vq.dtable[1].len.set(VIRTIO_BLK_ID_BYTES);
+                let request_type_addr = GuestAddress(vq.dtable[0].addr.get());
+                let status_addr = GuestAddress(vq.dtable[2].addr.get());
+                mem.write_obj::<u32>(VIRTIO_BLK_T_GET_ID, request_type_addr)
+                    .unwrap();
+                handle.kick(true);
+                let err = handle.pause(FlushMode::DrainAndFlush).unwrap_err();
+                assert!(matches!(
+                    err,
+                    BlockIoError::Qcow2(Qcow2IoError::Flush(err) | Qcow2IoError::MetadataFlush(err))
+                        if err.raw_os_error() == Some(libc::EIO)
+                ));
+                assert_eq!(vq.used.idx.get(), 1);
+                assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), VIRTIO_BLK_S_OK);
+                let resources = handle.reset();
+                handle.finish(FlushMode::Drain);
+                (resources, mem, file)
+            })
+            .join()
+            .unwrap();
+            let (resources, mem, file) = retry;
+            let block = default_block(FileEngineType::Sync);
+            let mut worker = BlockWorker {
+                resources,
+                active_state: ActiveState {
+                    mem,
+                    interrupt: default_interrupt(),
+                },
+                rate_limiter: block.rate_limiter.clone(),
+                is_blocked: block.lock_rate_limiter().clone_blocked_flag(),
+                discard_supported: false,
+                metrics: block.metrics.clone(),
+            };
+            worker.prepare_save(FlushMode::DrainAndFlush).unwrap();
+            let mem = worker.active_state.mem.clone();
+            drop(worker);
+            // After the failure filter is gone, a successful retry must persist the mappings.
+            let mut disk = DiskProperties::new(
+                file.as_path().to_str().unwrap(),
+                false,
+                FileEngineType::Sync,
+                DiskImageFormat::Qcow2,
+            )
+            .unwrap();
+            let FileEngine::Qcow2(engine) = &mut disk.file_engine else {
+                unreachable!()
+            };
+            engine.read(0, &mem, GuestAddress(4096), 512).unwrap();
+            let mut actual = [0; 512];
+            mem.read_slice(&mut actual, GuestAddress(4096)).unwrap();
+            assert_eq!(actual, [0xa5; 512]);
+        }
+    }
 
     #[test]
     fn test_control_msg_batch() {
@@ -791,7 +942,7 @@ mod tests {
 
         assert!(matches!(
             handle.from_worker.recv_timeout(RECV_TIMEOUT_SEC).unwrap(),
-            ControlResponse::Paused
+            ControlResponse::Paused(Ok(()))
         ));
         match handle.from_worker.recv_timeout(RECV_TIMEOUT_SEC).unwrap() {
             ControlResponse::QueueState(queue_state) => {
@@ -838,7 +989,7 @@ mod tests {
             handle.control_evt.write(1).unwrap();
             assert!(matches!(
                 handle.from_worker.recv_timeout(RECV_TIMEOUT_SEC).unwrap(),
-                ControlResponse::Paused
+                ControlResponse::Paused(Ok(()))
             ));
         };
         let queue_state = || {

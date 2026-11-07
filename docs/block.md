@@ -69,6 +69,39 @@ The `path_on_host` must be readable (and writable, when `is_read_only` is
 
 ## Configuration Options
 
+VMDK and QCOW2 support is in [developer preview](RELEASE_POLICY.md). Use them
+only for development and evaluation while the backend is being stabilized.
+
+### QCOW2 images
+
+Set `image_format` to `Qcow2` and `io_engine` to `Sync` for a regular QCOW2
+image file. Both v2 and v3 images are supported, including deflate compressed
+clusters. Images must be self-contained and unencrypted. Backing files, external
+data files, extended L2 entries, zstd compression and discard are unsupported.
+
+Writable images use a single queue. Read-only images can use multiple queues,
+but PATCH is restricted to single-queue QCOW2 drives. Changing capacity requires
+replacing the image file. See [drive updates](api_requests/patch-block.md).
+
+Use `cache_type=Writeback` when the guest needs durable flush requests. Keep a
+writable image under one writer's control, including host-side image tools.
+Firecracker's locks coordinate its QCOW2 engines using `flock`. QEMU's Linux OFD
+locks use a separate locking mechanism.
+
+Both graceful and forced PCI removal flush writable QCOW2 images before
+releasing them. A failed flush retains the device and its lock; retry after
+resolving the storage error. Forced removal still cannot preserve unsubmitted
+guest I/O.
+
+Firecracker snapshots save device state, not QCOW2 disk contents or internal
+snapshots. Preserve the matching image files separately when restoring or
+cloning a VM; each writable image still needs exclusive ownership.
+
+Writable opens check the active metadata for overlaps and unallocated metadata
+clusters. This scans the active L2 entries. It does not perform a full refcount
+reconciliation or validate inactive snapshot trees. Run `qemu-img check` on a
+closed image when its consistency is uncertain.
+
 ### Caching Strategy
 
 The `cache_type` field on a drive controls whether guest flush requests are
