@@ -898,7 +898,7 @@ mod tests {
             })
             .join()
             .unwrap();
-            let (resources, mem, _file) = retry;
+            let (resources, mem, file) = retry;
             let block = default_block(FileEngineType::Sync);
             let mut worker = BlockWorker {
                 resources,
@@ -912,6 +912,23 @@ mod tests {
                 metrics: block.metrics.clone(),
             };
             worker.prepare_save(FlushMode::DrainAndFlush).unwrap();
+            let mem = worker.active_state.mem.clone();
+            drop(worker);
+            // After the failure filter is gone, a successful retry must persist the mappings.
+            let mut disk = DiskProperties::new(
+                file.as_path().to_str().unwrap(),
+                false,
+                FileEngineType::Sync,
+                DiskImageFormat::Qcow2,
+            )
+            .unwrap();
+            let FileEngine::Qcow2(engine) = &mut disk.file_engine else {
+                unreachable!()
+            };
+            engine.read(0, &mem, GuestAddress(4096), 512).unwrap();
+            let mut actual = [0; 512];
+            mem.read_slice(&mut actual, GuestAddress(4096)).unwrap();
+            assert_eq!(actual, [0xa5; 512]);
         }
     }
 

@@ -2,14 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exercise independent qemu-img QCOW2 images through real guest block I/O."""
 
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 
 import pytest
+from tenacity import Retrying, stop_after_delay, wait_fixed
 
-from framework.artifacts import GUEST_KERNELS_5_10, pin_guest_kernel
+from framework.artifacts import GUEST_KERNELS_5_10, pin_guest_kernel, pin_pci
 from framework.utils import check_output, get_threads, run_cmd
 from framework.utils_vsock import (
     ECHO_SERVER_PORT,
@@ -230,6 +232,59 @@ def test_qcow2_unclean_shutdown(uvm, num_queues):
     assert json.loads(result.stdout).get("corruptions", 0) == 0
 
 
+@pin_pci(True)
+@pytest.mark.parametrize("cache_type", ["Unsafe", "Writeback"])
+def test_qcow2_pci_unplug(uvm, microvm_factory, num_queues, cache_type):
+    """Unplug flushes dirty mappings and releases locks before and after restore."""
+    uvm.spawn()
+    uvm.basic_config(pcie_hotplug_ports=1)
+    uvm.add_net_iface()
+    uvm.start()
+    vm = uvm
+
+    for phase in range(2):
+        if phase:
+            snapshot = vm.snapshot_full()
+            vm.kill()
+            vm = microvm_factory.build_from_snapshot(snapshot)
+
+        image, expected = _image(vm, f"hotplug-{phase}")
+        vm.add_drive(
+            "qcow2",
+            image,
+            image_format="Qcow2",
+            num_queues=num_queues,
+            cache_type=cache_type,
+        )
+        for attempt in Retrying(
+            stop=stop_after_delay(10), wait=wait_fixed(0.1), reraise=True
+        ):
+            with attempt:
+                rc, _, _ = vm.ssh.run("test -b /dev/vdb")
+                assert rc == 0
+        _assert_queue_mode(vm, num_queues)
+        _assert_guest_data(vm, expected)
+        _write_pattern(vm, expected, 6 * CLUSTER_SIZE + 512, 4096, 73, flush=False)
+        _assert_guest_data(vm, expected)
+
+        vm.api.drive.delete("qcow2")
+        for attempt in Retrying(
+            stop=stop_after_delay(15), wait=wait_fixed(0.1), reraise=True
+        ):
+            with attempt:
+                assert "qcow2" not in {
+                    drive["drive_id"]
+                    for drive in vm.api.vm_config.get().json()["drives"]
+                }
+                rc, _, _ = vm.ssh.run("test ! -b /dev/vdb")
+                assert rc == 0
+        _assert_queue_mode(vm, None)
+        del vm.disks["qcow2"]
+        with image.open("rb") as probe:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _check_closed_image(image, expected)
+
+
 def test_qcow2_snapshot_sync_failure(uvm, num_queues):
     """A failed disk sync rejects snapshots without losing the paused device or its data."""
     filter_path = Path(uvm.fsfiles) / "sync-error.json"
@@ -273,7 +328,10 @@ def test_qcow2_snapshot_sync_failure(uvm, num_queues):
                 uvm, expected, (6 + attempt) * CLUSTER_SIZE + 512, 4096, 23, flush=False
             )
             uvm.pause()
-            with pytest.raises(RuntimeError, match="QCOW2.*flush|QCOW2.*sync"):
+            with pytest.raises(
+                RuntimeError,
+                match=r"QCOW2 (metadata writeback|sync) error:.*os error 5",
+            ):
                 uvm.api.snapshot_create.put(
                     mem_file_path="failed_mem",
                     snapshot_path="failed_state",
@@ -286,7 +344,10 @@ def test_qcow2_snapshot_sync_failure(uvm, num_queues):
             connection.sendall(b"x")
             assert connection.recv(1) == b"x"
     uvm.kill()
-    _check_closed_image(image, expected)
+    # Every fsync is denied, so shutdown cannot promise durability of the cached mappings.
+    result = run_cmd(["qemu-img", "check", "-f", "qcow2", "--output=json", str(image)])
+    assert result.returncode in (0, 3), (result.stdout, result.stderr)
+    assert json.loads(result.stdout).get("corruptions", 0) == 0
 
 
 @pytest.mark.parametrize("cache_type", ["Unsafe", "Writeback"])

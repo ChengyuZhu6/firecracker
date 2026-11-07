@@ -9,21 +9,22 @@ including imago `d6a40eb5c21e963131a1b439facf252480d5d57e` and Firecracker fixes
 VMDK discussion used as the review checklist; it is not an upstream approval of
 this writable QCOW2 implementation.
 
-The implementation has required correctness fixes. Passing format tests alone is
-insufficient for merge approval. KVM guest, snapshot and PCI lifecycle tests
-remain a release gate, as do representative latency/throughput measurements.
+The implementation required correctness fixes. Image-layer and x86_64 KVM guest,
+snapshot and PCI lifecycle checks now pass as recorded below. AArch64 guest
+execution, supported-host-kernel coverage, representative performance and actual
+power-loss testing remain explicit validation limits.
 
 ## Findings addressed
 
-| Priority | Failure mode                                                                                                                                                                                      | Change and regression evidence                                                                                                                                                                                                                                                                                                                                                                             |
-| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| P1       | Refcount/L2 cache writes were ordered in userspace but could reach durable storage in the opposite order. A published mapping could refer to a zero-refcount cluster after power loss.            | imago now synchronizes dependency writes before publishing dependent metadata, including dirty cache eviction, refblock/reftable publication and old metadata reuse. The storage-event regression failed before this fix and passes afterward.                                                                                                                                                             |
-| P1       | Concurrent imago allocation could overtake an RB-cache snapshot and publish its L2 mapping in that same flush without a persisted refcount. Reopen/reallocation then overwrote the first mapping. | Re-establish L2→RB dependency after the refcount mutation, before making the mapping available. A deterministic regression reproduces a zero refcount and host-cluster alias on both ordinary and mandatory contiguous allocation paths; both fail before the fix and pass afterward. FC serializes writable access with one queue; the library still must preserve this invariant for concurrent callers. |
-| P1       | Snapshot paths could report success despite a QCOW2 flush failure, or reset other device state before learning that the block device could not be saved.                                          | Propagate QCOW2 errors, prepare block devices before destructive snapshot preparation, and cover Configuring/Inline/worker states. Guest regression retains a live vsock connection across failed snapshots and resume.                                                                                                                                                                                    |
-| P1       | Writable active metadata overlaps or missing metadata refcounts could direct writes into other metadata.                                                                                          | Validate the active structural metadata at writable self-contained open; reject before mutation. This is deliberately narrower than a complete image checker.                                                                                                                                                                                                                                              |
-| P1       | An acknowledged PCI removal could unregister/drop a QCOW2 engine even when flushing failed.                                                                                                       | Preflight writable QCOW2 before teardown; preserve the device, lock and acknowledgement on failure. Retry on a subsequent external event rather than self-signalling a busy loop. The regression injects `fsync=EIO`, verifies retention, then retries. It requires KVM and has only been compiled here.                                                                                                   |
-| P2       | Rejected/no-write opens could invalidate autoclear metadata such as persistent bitmaps; a cancelled header publication could complete late.                                                       | Defer autoclear publication until first mutation, serialize it and fail closed on uncertain completion. Include aligned asynchronous completion regressions.                                                                                                                                                                                                                                               |
-| P2       | Engine replacement, partial failed reads, teardown and get-id buffer handling had lifecycle or bookkeeping gaps.                                                                                  | Stage replacement before state mutation, handle same-inode PATCH without reopening its own lock, mark only copied guest bytes dirty, flush parked/dropped QCOW2 engines and accept larger get-id buffers.                                                                                                                                                                                                  |
+| Priority | Failure mode                                                                                                                                                                                      | Change and regression evidence                                                                                                                                                                                                                                                                                                                                                                                     |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| P1       | Refcount/L2 cache writes were ordered in userspace but could reach durable storage in the opposite order. A published mapping could refer to a zero-refcount cluster after power loss.            | imago now synchronizes dependency writes before publishing dependent metadata, including dirty cache eviction, refblock/reftable publication and old metadata reuse. The storage-event regression failed before this fix and passes afterward.                                                                                                                                                                     |
+| P1       | Concurrent imago allocation could overtake an RB-cache snapshot and publish its L2 mapping in that same flush without a persisted refcount. Reopen/reallocation then overwrote the first mapping. | Re-establish L2→RB dependency after the refcount mutation, before making the mapping available. A deterministic regression reproduces a zero refcount and host-cluster alias on both ordinary and mandatory contiguous allocation paths; both fail before the fix and pass afterward. FC serializes writable access with one queue; the library still must preserve this invariant for concurrent callers.         |
+| P1       | Snapshot paths could report success despite a QCOW2 flush failure, or reset other device state before learning that the block device could not be saved.                                          | Propagate QCOW2 errors, prepare block devices before destructive snapshot preparation, and cover Configuring/Inline/worker states. Guest regression retains a live vsock connection across failed snapshots and resume.                                                                                                                                                                                            |
+| P1       | Writable active metadata overlaps or missing metadata refcounts could direct writes into other metadata.                                                                                          | Validate the active structural metadata at writable self-contained open; reject before mutation. This is deliberately narrower than a complete image checker.                                                                                                                                                                                                                                                      |
+| P1       | An acknowledged PCI removal could unregister/drop a QCOW2 engine even when flushing failed.                                                                                                       | Preflight writable QCOW2 before teardown; preserve the device, lock and acknowledgement on failure. Retry on a subsequent external event rather than self-signalling a busy loop. The regression injects `fsync=EIO`, verifies retention, then retries. It now passes on the x86_64 KVM host. Guest hotplug/unplug also passes before and after restore with Inline/worker execution and Unsafe/Writeback caching. |
+| P2       | Rejected/no-write opens could invalidate autoclear metadata such as persistent bitmaps; a cancelled header publication could complete late.                                                       | Defer autoclear publication until first mutation, serialize it and fail closed on uncertain completion. Include aligned asynchronous completion regressions.                                                                                                                                                                                                                                                       |
+| P2       | Engine replacement, partial failed reads, teardown and get-id buffer handling had lifecycle or bookkeeping gaps.                                                                                  | Stage replacement before state mutation, handle same-inode PATCH without reopening its own lock, mark only copied guest bytes dirty, flush parked/dropped QCOW2 engines and accept larger get-id buffers.                                                                                                                                                                                                          |
 
 The durability regression models one newly destaged whole write surviving a
 power cut while other writes since the last successful sync are lost. It checks
@@ -121,22 +122,93 @@ Executed in this review session, with earlier rounds identified separately:
 - Earlier rounds: 12 real Firecracker preboot API cases, both seccomp policy
   architectures, and native aarch64 flock allow/deny probes passed.
 
-The local Linux VM has no `/dev/kvm`. The supplied test server was not reached
-through the configured authenticated route; no guest results on that machine are
-claimed. The new PCI failure/retry regression and the full QCOW2 guest suite
-therefore remain unexecuted. On a KVM test machine run:
+### KVM validation on 2026-11-07
+
+The explicitly authorized x86_64 KVM test host enabled the remaining runtime
+checks in a scoped directory under `/work/test`. The host was an Intel Core
+i7-13700, x86_64 Ubuntu 24.04.1, Linux 6.19.4-061904-generic, with Rust 1.99.1
+and QEMU 8.2.2. Runtime code was built from `7fe246c13`, with imago pinned to
+`d6a40eb`; this follow-up changes tests, artifact preparation and this report.
+
+The x86_64 musl release binaries include the normal seccomp policy. Ordinary
+guest cases use that policy; the four fsync-EIO cases deliberately replace it
+with the fault-injection filter. The Firecracker binary SHA-256 was
+`a1db99e484b2aacb79077714fd9f70ed5a0d69e5792cdce4c73882a9a9627788`.
+
+The guest used the official CI
+[Linux 5.10.271 artifact](https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20261105-6ea6634994fa-0/x86_64/vmlinux-5.10.271)
+and the existing Ubuntu 22.04 squashfs rootfs. The kernel SHA-256 was
+`38d9d7a4096e95df6d236c6372e5b8f8928892503517cb723187c31cc418bc74`. Its
+configuration enables `CONFIG_ACPI`, `CONFIG_PCI_MMCONFIG`, `CONFIG_HOTPLUG_PCI`
+and `CONFIG_HOTPLUG_PCI_PCIE`.
+
+The initially cached 5.10.245 image had `CONFIG_HOTPLUG_PCI` disabled and failed
+the new hotplug case. Replacing only the scoped kernel copy with the CI image
+made that case pass. An initial bind-mount layout also prevented hardlinks;
+artifacts and jailer roots were placed within the same mount before testing.
+These setup failures are excluded from the successful results.
+
+- The complete QCOW2 guest suite: **42/42 passed**, in 220.83 seconds. It covers
+  PCI/MMIO, Inline/one-worker execution, ordinary/compressed writes, live
+  truncation, abrupt termination, shared readonly queues, invalid
+  configurations, PATCH, root-disk boot, failed snapshot/resume, and
+  full/differential restore.
+- The new PCI case contributes four combinations: Inline/worker crossed with
+  Unsafe/Writeback. Each performs two insert/remove cycles, one before and one
+  after snapshot restore, exercising port reuse. After unflushed sparse writes,
+  removal must release the file lock, stop the worker and pass independent
+  qemu-img check plus a complete logical-content comparison.
+- Six existing PCI snapshot/hotplug cases also passed, in 43.61 seconds:
+  hotplugged-device persistence, graceful/forced removal after restore and
+  pending removal completion, each with booted/restored fixture lifecycles.
+  These used the official CI
+  [Ubuntu 24.04 rootfs](https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20261105-6ea6634994fa-0/x86_64/ubuntu-24.04.squashfs),
+  prepared with `tools/setup-ci-artifacts.sh` to inject a scoped guest SSH key.
+  The earlier cached Ubuntu 22.04 image lacks `lspci`, which these generic tests
+  require. Its 42 QCOW2 results above are recorded separately.
+- The KVM PCI `fsync=EIO` failure/retry unit test passed. The block suite passed
+  **82 tests** after adding a close/reopen data assertion to the snapshot retry
+  regression; vmm library and test code passed Clippy with `-D warnings`.
+
+The real EIO run exposed two obsolete guest-test expectations. Dependency sync
+can fail as a metadata-writeback error, so the assertion now checks the exact
+QCOW2 error stage and errno 5. Also, a filter denying every fsync cannot promise
+durability after termination: the observed image had two leaked clusters and
+zero corruptions. This fault case allows only clean/leak-only qemu-img results,
+retaining both failed-snapshot/resume and live-vsock/data checks. Positive cases
+still require a clean image and matching contents. Separately, the unit test
+removes the failure filter, successfully retries the flush, closes the engine,
+then reopens the image and verifies the original data.
+
+Preparing only the new rootfs exposed another fixture-tool bug: with no
+`*.debug.gz` files, `xargs` still invoked gunzip on empty input and returned
+123\. Adding `xargs -r` makes the real setup workflow succeed. No new dependency
+or skip was introduced.
+
+Rootfs hashes for the two test rounds:
+
+| Image                                                          | SHA-256                                                            |
+| -------------------------------------------------------------- | ------------------------------------------------------------------ |
+| Cached Ubuntu 22.04 used by the 42 QCOW2 cases                 | `e9550a4ad1b979c85e6edadf2ec3bea3dd649f274f4690e2dc9347063c45c16f` |
+| Official Ubuntu 24.04 download                                 | `91da33c2013bd1b018f2c1e6b3d37a3316e0ff8c19a71de640d7a4c3ca31b92b` |
+| Ubuntu 24.04 after scoped SSH-key setup, used by six PCI cases | `f9567c8f1c9d9b4f2a0b5465e190a3912fb7b3c50de6c8aa62132f57a8cf3846` |
+
+To repeat in a configured KVM development environment:
 
 ```sh
 cargo test -p vmm --lib test_qcow2_unplug_retries_failed_sync
+cargo test -p vmm --lib test_qcow2_snapshot_flush_error
 ./tools/devtool test -- integration_tests/functional/test_qcow2.py
+./tools/devtool test -- integration_tests/functional/test_hotplug.py -k 'test_hotplug_preserved_after_snapshot or test_unplug_after_snapshot or test_pending_unplug_completes_after_restore'
 ```
 
-Run both supported CPU architectures and normal filtered worker execution, then
-measure allocation-heavy random I/O and flush latency. Validate every closed
-image with qemu-img check and logical-content comparison, and remove test
-images/build scratch after each round. The scoped QEMU interoperability
-harness/images and build outputs were removed after that round; shared checkouts
-and pre-existing user files are preserved.
+The local aarch64 Linux VM still has no `/dev/kvm`, so its earlier unit/build
+results are not AArch64 guest evidence. Linux 6.19 on this x86_64 host also does
+not replace coverage of the project's supported host kernels. Allocation-heavy
+random I/O and flush latency still need representative performance measurement.
+Test VMs/images were removed between rounds; all scoped build/kernel/test
+scratch is removed at completion, preserving the host's original checkout and
+artifacts.
 
 Other limits: active-open validation is not a complete refcount/COPIED-bit,
 inactive snapshot or bitmap checker; same-inode PATCH does not resize; preboot
