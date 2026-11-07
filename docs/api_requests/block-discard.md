@@ -9,11 +9,12 @@ Discard is configured per virtio-block device through the `discard` field in the
 
 ## Supported configuration
 
-Discard is currently supported only for writable virtio-block devices using the
-`Sync` IO engine. It is not supported for:
+Discard is supported for writable virtio-block devices using raw images with
+the `Sync` IO engine, or QCOW2 images with either `Sync` or `Async`.
+Unsupported configurations include:
 
 - read-only drives;
-- `Async` IO engine drives;
+- raw images using the `Async` IO engine;
 - vhost-user block devices.
 
 Raw regular files use hole punching, and raw block devices use `BLKDISCARD`.

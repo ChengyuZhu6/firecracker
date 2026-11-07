@@ -74,7 +74,7 @@ only for development and evaluation while the backend is being stabilized.
 
 ### QCOW2 images
 
-Set `image_format` to `Qcow2` and `io_engine` to `Sync` for a regular QCOW2
+Set `image_format` to `Qcow2` and `io_engine` to `Sync` or `Async` for a regular QCOW2
 image file. Both v2 and v3 images are supported, including deflate compressed
 clusters. Images must be self-contained and unencrypted. Backing files, external
 data files, extended L2 entries and zstd compression are unsupported.
@@ -84,7 +84,13 @@ including partial clusters, while internal snapshots retain their referenced dat
 Unreferenced data clusters are reclaimed with host hole punching when supported.
 Host filesystem alignment and shared clusters can limit physical space recovery.
 
-Writable images use a single queue. Read-only images can use multiple queues,
+The QCOW2 `Async` engine submits ordinary data reads and writes through `io_uring`,
+with one guest request in flight per queue. Metadata operations, compressed reads,
+flush and discard run synchronously on the queue's processing thread. Setting
+`num_queues=1` moves that processing to a dedicated worker.
+
+Writable images and the QCOW2 `Async` engine use a single queue.
+Read-only images using `Sync` can use multiple queues,
 but PATCH is restricted to single-queue QCOW2 drives. Changing capacity requires
 replacing the image file. See [drive updates](api_requests/patch-block.md).
 
@@ -187,9 +193,9 @@ Setting `is_read_only` to `true` causes Firecracker to open the backing file
 ### Discard
 
 The `discard` field enables the `VIRTIO_BLK_F_DISCARD` feature for a drive.
-Discard is disabled by default and is available only for writable drives that
-use the `Sync` IO engine. See [block-discard.md](api_requests/block-discard.md)
-for configuration details and backend behavior.
+Discard is disabled by default and is available for writable raw drives using
+`Sync` and writable QCOW2 drives using either engine. Configuration details and
+backend behavior are described in [block-discard.md](api_requests/block-discard.md).
 
 ### Rate Limiting
 

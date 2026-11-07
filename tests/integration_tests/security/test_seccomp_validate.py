@@ -42,6 +42,12 @@ def test_qcow2_syscalls(arch):
             [(1, "dword", "eq", fcntl.LOCK_SH | fcntl.LOCK_NB)],
             [(1, "dword", "eq", fcntl.LOCK_EX | fcntl.LOCK_NB)],
         ]
+        assert "fcntl" not in unrestricted
+        assert [(1, "dword", "eq", fcntl.F_DUPFD_CLOEXEC)] in [
+            [(arg["index"], arg["type"], arg["op"], arg["val"]) for arg in rule["args"]]
+            for rule in thread_filter["filter"]
+            if rule["syscall"] == "fcntl"
+        ]
 
 
 @pytest.fixture

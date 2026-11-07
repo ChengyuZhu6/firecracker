@@ -130,7 +130,10 @@ impl Persist<'_> for VirtioBlock {
         if num_queues > 1 && !mq_offered {
             return Err(VirtioBlockError::Persist(PersistError::InvalidInput));
         }
-        if state.disk_image_format == DiskImageFormat::Qcow2 && !is_read_only && num_queues > 1 {
+        if state.disk_image_format == DiskImageFormat::Qcow2
+            && (!is_read_only || state.file_engine_type == FileEngineTypeState::Async)
+            && num_queues > 1
+        {
             return Err(VirtioBlockError::FileEngine(
                 super::io::BlockIoError::Qcow2(super::io::Qcow2IoError::MultiQueueNotSupported),
             ));
@@ -153,7 +156,10 @@ impl Persist<'_> for VirtioBlock {
         if config.discard && config.is_read_only {
             return Err(VirtioBlockError::DiscardReadOnlyUnsupported);
         }
-        if config.discard && config.file_engine_type == FileEngineType::Async {
+        if config.discard
+            && config.file_engine_type == FileEngineType::Async
+            && config.image_format != DiskImageFormat::Qcow2
+        {
             return Err(VirtioBlockError::DiscardAsyncUnsupported);
         }
 
@@ -269,55 +275,136 @@ mod tests {
         use crate::devices::virtio::block::virtio::test_utils::create_test_qcow2;
 
         let file = create_test_qcow2();
-        for read_only in [false, true] {
-            for num_queues in [None, NonZeroU16::new(1), NonZeroU16::new(2)] {
-                let mut config = default_config(
-                    file.as_path().to_str().unwrap().to_string(),
-                    FileEngineType::Sync,
-                );
-                config.drive_id = "qcow2_persistence".to_string();
-                config.image_format = DiskImageFormat::Qcow2;
-                config.is_read_only = true;
-                config.num_queues = num_queues;
-                let block = VirtioBlock::new(config).unwrap();
-                let mut state = block.save();
-                drop(block);
-                if !read_only {
-                    state.virtio_state.avail_features &= !(1u64 << VIRTIO_BLK_F_RO);
-                }
-                let serialized = bitcode::serialize(&state).unwrap();
-                let restored_state = bitcode::deserialize(&serialized).unwrap();
-                let result = VirtioBlock::restore(
-                    BlockConstructorArgs { mem: default_mem() },
-                    &restored_state,
-                );
-                if !read_only && num_queues == NonZeroU16::new(2) {
-                    assert!(matches!(
-                        result,
-                        Err(VirtioBlockError::FileEngine(
-                            super::io::BlockIoError::Qcow2(
-                                super::io::Qcow2IoError::MultiQueueNotSupported
-                            )
-                        ))
-                    ));
-                } else {
-                    let restored = result.unwrap();
-                    assert_eq!(restored.config().image_format, DiskImageFormat::Qcow2);
-                    assert_eq!(restored.config().is_read_only, read_only);
-                    assert_eq!(restored.config().num_queues, num_queues);
-                    drop(restored);
-                    state.virtio_state.avail_features |= 1u64 << VIRTIO_BLK_F_DISCARD;
-                    let result =
-                        VirtioBlock::restore(BlockConstructorArgs { mem: default_mem() }, &state);
-                    if read_only {
+        for engine in [FileEngineType::Sync, FileEngineType::Async] {
+            for read_only in [false, true] {
+                for num_queues in [None, NonZeroU16::new(1), NonZeroU16::new(2)] {
+                    let mut config = default_config(
+                        file.as_path().to_str().unwrap().to_string(),
+                        FileEngineType::Sync,
+                    );
+                    config.drive_id = "qcow2_persistence".to_string();
+                    config.image_format = DiskImageFormat::Qcow2;
+                    config.is_read_only = true;
+                    config.num_queues = num_queues;
+                    let block = VirtioBlock::new(config).unwrap();
+                    let mut state = block.save();
+                    drop(block);
+                    state.file_engine_type = engine.into();
+                    if !read_only {
+                        state.virtio_state.avail_features &= !(1u64 << VIRTIO_BLK_F_RO);
+                    }
+                    let serialized = bitcode::serialize(&state).unwrap();
+                    let restored_state = bitcode::deserialize(&serialized).unwrap();
+                    let result = VirtioBlock::restore(
+                        BlockConstructorArgs { mem: default_mem() },
+                        &restored_state,
+                    );
+                    if (!read_only || engine == FileEngineType::Async)
+                        && num_queues == NonZeroU16::new(2)
+                    {
                         assert!(matches!(
                             result,
-                            Err(VirtioBlockError::DiscardReadOnlyUnsupported)
+                            Err(VirtioBlockError::FileEngine(
+                                super::io::BlockIoError::Qcow2(
+                                    super::io::Qcow2IoError::MultiQueueNotSupported
+                                )
+                            ))
                         ));
                     } else {
-                        assert!(result.unwrap().config().discard);
+                        let restored = result.unwrap();
+                        assert_eq!(restored.config().image_format, DiskImageFormat::Qcow2);
+                        assert_eq!(restored.config().is_read_only, read_only);
+                        assert_eq!(restored.config().num_queues, num_queues);
+                        assert_eq!(restored.file_engine_type(), engine);
+                        assert_eq!(
+                            restored.resources()[0]
+                                .disk
+                                .file_engine
+                                .completion_evt()
+                                .is_some(),
+                            engine == FileEngineType::Async
+                        );
+                        drop(restored);
+                        state.virtio_state.avail_features |= 1u64 << VIRTIO_BLK_F_DISCARD;
+                        let result = VirtioBlock::restore(
+                            BlockConstructorArgs { mem: default_mem() },
+                            &state,
+                        );
+                        if read_only {
+                            assert!(matches!(
+                                result,
+                                Err(VirtioBlockError::DiscardReadOnlyUnsupported)
+                            ));
+                        } else {
+                            assert!(result.unwrap().config().discard);
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn test_qcow2_persistence_discard_negotiation() {
+        use crate::devices::virtio::block::virtio::test_utils::{
+            RequestDescriptorChain, create_test_qcow2, simulate_queue_event,
+        };
+        use crate::devices::virtio::generated::virtio_blk::{
+            VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP, VIRTIO_BLK_T_DISCARD,
+        };
+        use crate::devices::virtio::queue::VIRTQ_DESC_F_NEXT;
+        use crate::vstate::memory::Bytes;
+
+        let file = create_test_qcow2();
+        for engine in [FileEngineType::Sync, FileEngineType::Async] {
+            for negotiated in [false, true] {
+                let mut config =
+                    default_config(file.as_path().to_str().unwrap().to_string(), engine);
+                config.image_format = DiskImageFormat::Qcow2;
+                config.discard = true;
+                let mut block = VirtioBlock::new(config).unwrap();
+                if negotiated {
+                    block.set_acked_features(1u64 << VIRTIO_BLK_F_DISCARD);
+                }
+                let state = block.save();
+                drop(block);
+                let serialized = bitcode::serialize(&state).unwrap();
+                let restored_state = bitcode::deserialize(&serialized).unwrap();
+                let mem = default_mem();
+                let mut restored = VirtioBlock::restore(
+                    BlockConstructorArgs { mem: mem.clone() },
+                    &restored_state,
+                )
+                .unwrap();
+                assert!(restored.config().discard);
+                assert_eq!(restored.file_engine_type(), engine);
+                assert_eq!(restored.avail_features(), state.virtio_state.avail_features);
+                assert_eq!(restored.acked_features(), state.virtio_state.acked_features);
+
+                let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+                set_queue(&mut restored, 0, vq.create_queue());
+                let chain = RequestDescriptorChain::new(&vq);
+                chain.set_header(RequestHeader::new(VIRTIO_BLK_T_DISCARD, 0));
+                chain.data_desc.flags.set(VIRTQ_DESC_F_NEXT);
+                chain.data_desc.len.set(16);
+                let mut range = [0u8; 16];
+                range[8..12].copy_from_slice(&1u32.to_le_bytes());
+                mem.write_slice(&range, GuestAddress(chain.data_desc.addr.get()))
+                    .unwrap();
+                restored.activate(mem.clone(), default_interrupt()).unwrap();
+                simulate_queue_event(&mut restored, Some(true));
+                assert_eq!(vq.used.idx.get(), 1);
+                assert_eq!(vq.used.ring[0].get().len, 1);
+                let expected = if negotiated {
+                    VIRTIO_BLK_S_OK
+                } else {
+                    VIRTIO_BLK_S_UNSUPP
+                };
+                assert_eq!(
+                    mem.read_obj::<u8>(GuestAddress(chain.status_desc.addr.get()))
+                        .unwrap(),
+                    u8::try_from(expected).unwrap()
+                );
             }
         }
     }

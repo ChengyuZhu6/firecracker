@@ -108,6 +108,7 @@ impl DiskProperties {
         is_disk_read_only: bool,
         file_engine_type: FileEngineType,
         image_format: DiskImageFormat,
+        completion_evt: Option<EventFd>,
     ) -> Result<(FileEngine, u64), VirtioBlockError> {
         match image_format {
             DiskImageFormat::Vmdk => {
@@ -130,16 +131,12 @@ impl DiskProperties {
                 Ok((FileEngine::Vmdk(vmdk_engine), disk_size))
             }
             DiskImageFormat::Qcow2 => {
-                if file_engine_type == FileEngineType::Async {
-                    return Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
-                        block_io::Qcow2IoError::AsyncNotSupported,
-                    )));
-                }
-
-                let qcow2_engine = block_io::Qcow2FileEngine::from_file(
+                let qcow2_engine = block_io::Qcow2FileEngine::from_file_with_engine(
                     disk_image,
                     Path::new(disk_image_path),
                     is_disk_read_only,
+                    file_engine_type,
+                    completion_evt,
                 )
                 .map_err(|e| VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(e)))?;
                 let disk_size = qcow2_engine.disk_size();
@@ -169,6 +166,7 @@ impl DiskProperties {
             is_disk_read_only,
             file_engine_type,
             image_format,
+            None,
         )?;
 
         Ok(Self {
@@ -187,11 +185,17 @@ impl DiskProperties {
         let image_format = DiskImageFormat::from(&self.file_engine);
         let mut disk_image = Self::open_file(&disk_image_path, is_disk_read_only, image_format)?;
         let image_id = Self::build_disk_image_id(&disk_image);
-        if let FileEngine::Qcow2(engine) = &self.file_engine {
+        let mut file_engine_type = FileEngineType::Sync;
+        let mut completion_evt = None;
+        if let FileEngine::Qcow2(engine) = &mut self.file_engine {
             let same_file = engine
                 .same_file(&disk_image)
                 .map_err(|err| VirtioBlockError::BackingFile(err, disk_image_path.clone()))?;
             // Finish persisting the old image before opening a writable replacement.
+            engine
+                .drain(true)
+                .map_err(block_io::BlockIoError::Qcow2)
+                .map_err(VirtioBlockError::FileEngine)?;
             engine
                 .flush()
                 .map_err(block_io::BlockIoError::Qcow2)
@@ -199,6 +203,10 @@ impl DiskProperties {
             if same_file {
                 self.image_id = image_id;
                 return Ok(());
+            }
+            if let Some(event) = engine.completion_evt() {
+                file_engine_type = FileEngineType::Async;
+                completion_evt = Some(event.try_clone().map_err(VirtioBlockError::EventFd)?);
             }
         }
 
@@ -213,13 +221,22 @@ impl DiskProperties {
                 .map_err(VirtioBlockError::FileEngine)?;
             disk_size
         } else {
-            let (file_engine, disk_size) = Self::from_disk_image(
+            let (mut file_engine, disk_size) = Self::from_disk_image(
                 &disk_image_path,
                 disk_image,
                 is_disk_read_only,
-                FileEngineType::Sync,
+                file_engine_type,
                 image_format,
+                completion_evt,
             )?;
+            if let (FileEngine::Qcow2(old), FileEngine::Qcow2(new)) =
+                (&mut self.file_engine, &mut file_engine)
+                && let (Some(old_event), Some(new_event)) =
+                    (old.completion_evt_mut(), new.completion_evt_mut())
+            {
+                // Epoll unregister needs the descriptor number used at registration.
+                std::mem::swap(old_event, new_event);
+            }
             self.file_engine = file_engine;
             disk_size
         };
@@ -536,17 +553,22 @@ pub(crate) struct BlockResources {
 }
 
 impl BlockResources {
-    /// Drain pending I/O and clear engine throttling
+    /// Stop pending I/O and clear engine throttling.
     fn reset(&mut self) {
         // The guest may reuse its buffers once the reset completes, so wait for every operation
         // still in flight. The wait retries EINTR; any other error leaves the engine in an unknown
         // state, so stop rather than complete the reset with operations in flight.
         // TODO: decide whether the wait should be bounded.
         // https://github.com/firecracker-microvm/firecracker/issues/6281
-        self.disk
-            .file_engine
-            .drain(true)
-            .expect("Failed to reset block IO engine");
+        match &mut self.disk.file_engine {
+            // Reset runs under the vCPU filter, which cannot publish QCOW2 metadata.
+            FileEngine::Qcow2(engine) => engine.cancel().unwrap_or_else(|err| {
+                // Unwinding would run teardown's metadata drain under the vCPU filter.
+                error!("Failed to cancel QCOW2 I/O during reset: {err}");
+                std::process::abort();
+            }),
+            engine => engine.drain(true).expect("Failed to reset block IO engine"),
+        }
         self.is_io_engine_throttled = false;
     }
 }
@@ -560,13 +582,19 @@ impl VirtioBlock {
             return Err(VirtioBlockError::DiscardReadOnlyUnsupported);
         }
 
-        if config.discard && config.file_engine_type == FileEngineType::Async {
+        if config.discard
+            && config.file_engine_type == FileEngineType::Async
+            && config.image_format != DiskImageFormat::Qcow2
+        {
             return Err(VirtioBlockError::DiscardAsyncUnsupported);
         }
         let num_queues = config
             .num_queues
             .map_or(DEFAULT_BLOCK_NUM_QUEUES, NonZeroU16::get);
-        if config.image_format == DiskImageFormat::Qcow2 && !config.is_read_only && num_queues > 1 {
+        if config.image_format == DiskImageFormat::Qcow2
+            && (!config.is_read_only || config.file_engine_type == FileEngineType::Async)
+            && num_queues > 1
+        {
             return Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
                 block_io::Qcow2IoError::MultiQueueNotSupported,
             )));
@@ -1149,10 +1177,13 @@ impl Drop for VirtioBlock {
         };
 
         match std::mem::replace(&mut self.state, BlockRuntimeState::Placeholder) {
-            BlockRuntimeState::Inline(mut worker) => match flush_mode {
-                FlushMode::Drain => worker.drain(true),
-                FlushMode::DrainAndFlush => worker.drain_and_flush(true),
-            },
+            BlockRuntimeState::Inline(mut worker) => {
+                match flush_mode {
+                    FlushMode::Drain => worker.drain(true),
+                    FlushMode::DrainAndFlush => worker.drain_and_flush(true),
+                }
+                worker.resources.queue.commit_dirty();
+            }
             BlockRuntimeState::Threaded(mut active) => {
                 let last = active
                     .worker_handles
@@ -1615,6 +1646,237 @@ mod tests {
         assert_eq!(&actual[..512], &[0x5a; 512]);
         assert_eq!(&actual[512..], &[0; 512]);
         engine.flush().unwrap();
+    }
+
+    #[test]
+    fn test_qcow2_async_snapshot_failure_and_patch() {
+        use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+
+        use crate::devices::virtio::block::virtio::test_utils::{
+            create_test_qcow2, default_config, syscall_eio_filter,
+        };
+        use crate::seccomp::apply_filter;
+
+        let file = create_test_qcow2();
+        let replacement = create_test_qcow2();
+        let mut config = default_config(
+            file.as_path().to_str().unwrap().to_string(),
+            FileEngineType::Async,
+        );
+        config.image_format = DiskImageFormat::Qcow2;
+        config.drive_id = "qcow2_async_snapshot_patch".to_string();
+        let mut block = VirtioBlock::new(config).unwrap();
+        let mem = default_mem();
+        mem.write_slice(&[0x5a; 1024], GuestAddress(0x6000))
+            .unwrap();
+        let FileEngine::Qcow2(engine) = &mut block.resources_mut()[0].disk.file_engine else {
+            unreachable!()
+        };
+        engine.write(0, &mem, GuestAddress(0x6000), 1024).unwrap();
+        engine.flush().unwrap();
+
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        set_queue(&mut block, 0, vq.create_queue());
+        let chain = RequestDescriptorChain::new(&vq);
+        chain.set_header(RequestHeader::new(VIRTIO_BLK_T_IN, 0));
+        chain.data_desc.len.set(1024);
+        // A malformed second chain must remain unparsed while the first request is busy.
+        vq.dtable[3].set(0, 0, VIRTQ_DESC_F_WRITE, 0);
+        vq.avail.ring[1].set(3);
+        vq.avail.idx.set(2);
+        block.activate(mem.clone(), default_interrupt()).unwrap();
+        simulate_queue_event(&mut block, None);
+        assert!(block.resources()[0].disk.file_engine.is_busy());
+        assert!(block.resources()[0].is_io_engine_throttled);
+        assert_eq!(block.metrics.execute_fails.fetch_diff(), 0);
+        assert_eq!(vq.used.idx.get(), 0);
+
+        thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    apply_filter(&syscall_eio_filter(libc::SYS_fsync)).unwrap();
+                    let err = block.prepare_save().unwrap_err();
+                    match err {
+                        crate::devices::virtio::persist::PersistError::BlockIo(
+                            block_io::BlockIoError::Qcow2(
+                                block_io::Qcow2IoError::Flush(err)
+                                | block_io::Qcow2IoError::MetadataFlush(err),
+                            ),
+                        ) => assert_eq!(err.raw_os_error(), Some(libc::EIO)),
+                        err => panic!("Unexpected snapshot error: {err:?}"),
+                    }
+                })
+                .join()
+                .unwrap();
+        });
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(vq.used.ring[0].get().len, 1025);
+        assert_eq!(
+            mem.read_obj::<u8>(GuestAddress(chain.status_desc.addr.get()))
+                .unwrap(),
+            u8::try_from(VIRTIO_BLK_S_OK).unwrap(),
+        );
+        let mut actual = [0; 1024];
+        mem.read_slice(&mut actual, GuestAddress(chain.data_desc.addr.get()))
+            .unwrap();
+        assert_eq!(actual, [0x5a; 1024]);
+        assert!(!block.resources()[0].disk.file_engine.is_busy());
+        assert!(!block.resources()[0].is_io_engine_throttled);
+        block.prepare_save().unwrap();
+
+        let completion_fd = block.resources()[0]
+            .disk
+            .file_engine
+            .completion_evt()
+            .unwrap()
+            .as_raw_fd();
+        let epoll = Epoll::new().unwrap();
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                completion_fd,
+                EpollEvent::new(EventSet::IN, 0),
+            )
+            .unwrap();
+        // Submit another read against the original image before replacing it.
+        mem.write_slice(&[0; 1024], GuestAddress(chain.data_desc.addr.get()))
+            .unwrap();
+        vq.avail.ring[1].set(0);
+        simulate_queue_event(&mut block, None);
+        assert!(block.resources()[0].disk.file_engine.is_busy());
+        assert_eq!(vq.used.idx.get(), 1);
+        block
+            .update_disk_image(replacement.as_path().to_str().unwrap().to_string())
+            .unwrap();
+        assert_eq!(vq.used.idx.get(), 2);
+        assert_eq!(vq.used.ring[1].get().len, 1025);
+        mem.read_slice(&mut actual, GuestAddress(chain.data_desc.addr.get()))
+            .unwrap();
+        assert_eq!(actual, [0x5a; 1024]);
+        assert_eq!(block.file_engine_type(), FileEngineType::Async);
+        let replacement_fd = block.resources()[0]
+            .disk
+            .file_engine
+            .completion_evt()
+            .unwrap()
+            .as_raw_fd();
+        assert_eq!(replacement_fd, completion_fd);
+        epoll
+            .ctl(
+                ControlOperation::Delete,
+                replacement_fd,
+                EpollEvent::new(EventSet::empty(), 0),
+            )
+            .unwrap();
+        chain.set_header(RequestHeader::new(VIRTIO_BLK_T_OUT, 1));
+        chain.data_desc.flags.set(VIRTQ_DESC_F_NEXT);
+        mem.write_slice(&[0xa7; 1024], GuestAddress(chain.data_desc.addr.get()))
+            .unwrap();
+        vq.avail.ring[2].set(0);
+        vq.avail.idx.set(3);
+        simulate_queue_event(&mut block, None);
+        assert!(block.resources()[0].disk.file_engine.is_busy());
+        drop(block);
+        let mut reader = block_io::Qcow2FileEngine::from_file(
+            File::open(replacement.as_path()).unwrap(),
+            replacement.as_path(),
+            true,
+        )
+        .unwrap();
+        reader.read(512, &mem, GuestAddress(0x6000), 1024).unwrap();
+        mem.read_slice(&mut actual, GuestAddress(0x6000)).unwrap();
+        assert_eq!(actual, [0xa7; 1024]);
+    }
+
+    #[test]
+    #[ignore = "requires FC_SECCOMP_FILTER_PATH with compiled default seccomp policy"]
+    fn test_qcow2_async_reset_under_vcpu_seccomp() {
+        use crate::devices::virtio::block::virtio::test_utils::{
+            create_test_qcow2, default_config,
+        };
+        use crate::seccomp::{apply_filter, deserialize_binary};
+        use crate::test_utils::single_region_mem_dirty_tracking;
+        use crate::vstate::memory::GuestMemoryExtension;
+
+        let filter_path = std::env::var_os("FC_SECCOMP_FILTER_PATH")
+            .expect("Set FC_SECCOMP_FILTER_PATH to the compiled default seccomp policy");
+        let mut filters = deserialize_binary(File::open(filter_path).unwrap()).unwrap();
+        let vcpu_filter = filters.remove("vcpu").unwrap();
+        assert!(!vcpu_filter.is_empty());
+
+        let file = create_test_qcow2();
+        let mut config = default_config(
+            file.as_path().to_str().unwrap().to_string(),
+            FileEngineType::Async,
+        );
+        config.image_format = DiskImageFormat::Qcow2;
+        let mut block = VirtioBlock::new(config).unwrap();
+        let count = 2 * 65536 + 512;
+        let request_len = u32::try_from(count).unwrap();
+        let addr = GuestAddress(0x6000);
+        let mem = single_region_mem_dirty_tracking(0x40000);
+        mem.write_slice(&vec![0xa7; count], addr).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        set_queue(&mut block, 0, vq.create_queue());
+        let chain = RequestDescriptorChain::new(&vq);
+        chain.set_header(RequestHeader::new(VIRTIO_BLK_T_OUT, 1));
+        chain.data_desc.flags.set(VIRTQ_DESC_F_NEXT);
+        chain.data_desc.addr.set(addr.raw_value());
+        chain.data_desc.len.set(request_len);
+        block.activate(mem.clone(), default_interrupt()).unwrap();
+        simulate_queue_event(&mut block, None);
+        assert!(block.resources()[0].disk.file_engine.is_busy());
+        assert_eq!(vq.used.idx.get(), 0);
+
+        let reset = thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    apply_filter(&vcpu_filter).unwrap();
+                    block.reset()
+                })
+                .join()
+                .unwrap()
+        });
+        assert!(reset);
+        assert!(!block.is_activated());
+        assert!(!block.resources()[0].disk.file_engine.is_busy());
+        assert!(!block.resources()[0].is_io_engine_throttled);
+        assert_eq!(vq.used.idx.get(), 0);
+        let FileEngine::Qcow2(engine) = &mut block.resources_mut()[0].disk.file_engine else {
+            unreachable!()
+        };
+        engine.read(512, &mem, addr, request_len).unwrap();
+        let mut actual = vec![0; count];
+        mem.read_slice(&mut actual, addr).unwrap();
+        // The kernel payload finished, but its mapping was never published by reset.
+        assert!(actual.iter().all(|byte| *byte == 0));
+
+        mem.write_slice(&vec![0x5d; count], addr).unwrap();
+        set_queue(&mut block, 0, vq.create_queue());
+        block.activate(mem.clone(), default_interrupt()).unwrap();
+        mem.reset_dirty();
+        simulate_queue_event(&mut block, None);
+        assert!(block.resources()[0].disk.file_engine.is_busy());
+        block.prepare_save().unwrap();
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(vq.used.ring[0].get().len, 1);
+        assert_eq!(
+            mem.read_obj::<u8>(GuestAddress(chain.status_desc.addr.get()))
+                .unwrap(),
+            u8::try_from(VIRTIO_BLK_S_OK).unwrap()
+        );
+        assert!(!used_ring_dirty(&mem, &vq));
+        drop(block);
+        assert!(used_ring_dirty(&mem, &vq));
+        let mut reader = block_io::Qcow2FileEngine::from_file(
+            File::open(file.as_path()).unwrap(),
+            file.as_path(),
+            true,
+        )
+        .unwrap();
+        reader.read(512, &mem, addr, request_len).unwrap();
+        mem.read_slice(&mut actual, addr).unwrap();
+        assert!(actual.iter().all(|byte| *byte == 0x5d));
     }
 
     #[test]
@@ -2481,6 +2743,125 @@ mod tests {
     }
 
     #[test]
+    fn test_qcow2_async_rate_limiter() {
+        use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+
+        use crate::devices::virtio::block::virtio::test_utils::{
+            create_test_qcow2, default_config,
+        };
+
+        for (bytes, ops) in [(512, 2), (1024, 1)] {
+            let file = create_test_qcow2();
+            let mut config = default_config(
+                file.as_path().to_str().unwrap().to_string(),
+                FileEngineType::Async,
+            );
+            config.image_format = DiskImageFormat::Qcow2;
+            config.drive_id = format!("qcow2_async_rate_{bytes}_{ops}");
+            let mut block = VirtioBlock::new(config).unwrap();
+            let clock = MockClock::new();
+            set_rate_limiter(
+                &mut block,
+                RateLimiter::new_mocked(bytes, 0, 100, ops, 0, 100, &clock),
+            );
+            let mem = default_mem();
+            let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+            set_queue(&mut block, 0, vq.create_queue());
+            let chain = RequestDescriptorChain::new(&vq);
+            chain.set_header(RequestHeader::new(VIRTIO_BLK_T_OUT, 0));
+            chain.data_desc.flags.set(VIRTQ_DESC_F_NEXT);
+            chain.data_desc.len.set(512);
+            vq.dtable[3].set(0x4000, 16, VIRTQ_DESC_F_NEXT, 4);
+            vq.dtable[4].set(0x5000, 512, VIRTQ_DESC_F_NEXT, 5);
+            vq.dtable[5].set(0x6000, 1, VIRTQ_DESC_F_WRITE, 0);
+            mem.write_obj(
+                RequestHeader::new(VIRTIO_BLK_T_OUT, 1),
+                GuestAddress(0x4000),
+            )
+            .unwrap();
+            for status in [0x3000, 0x6000] {
+                mem.write_obj(0xffu8, GuestAddress(status)).unwrap();
+            }
+            vq.avail.ring[1].set(3);
+            vq.avail.idx.set(2);
+            block.activate(mem.clone(), default_interrupt()).unwrap();
+
+            let epoll = Epoll::new().unwrap();
+            epoll
+                .ctl(
+                    ControlOperation::Add,
+                    block.resources()[0]
+                        .disk
+                        .file_engine
+                        .completion_evt()
+                        .unwrap()
+                        .as_raw_fd(),
+                    EpollEvent::new(EventSet::IN, 0),
+                )
+                .unwrap();
+            let mut events = [EpollEvent::default(); 1];
+            simulate_queue_event(&mut block, Some(false));
+            assert!(block.resources()[0].disk.file_engine.is_busy());
+            assert!(block.resources()[0].is_io_engine_throttled);
+            assert_eq!(block.resources()[0].queue.next_avail.0, 1);
+            assert_eq!(vq.used.idx.get(), 0);
+            assert!(!block.lock_rate_limiter().is_blocked());
+            assert_eq!(
+                block.lock_rate_limiter().bandwidth().unwrap().budget(),
+                bytes - 512
+            );
+            assert_eq!(block.lock_rate_limiter().ops().unwrap().budget(), ops - 1);
+            assert_eq!(block.metrics.rate_limiter_throttled_events.count(), 0);
+
+            assert_eq!(epoll.wait(1000, &mut events).unwrap(), 1);
+            block.process_async_completion_event();
+            assert_eq!(vq.used.idx.get(), 1);
+            assert_eq!(block.resources()[0].queue.next_avail.0, 1);
+            assert!(!block.resources()[0].disk.file_engine.is_busy());
+            assert!(!block.resources()[0].is_io_engine_throttled);
+            assert!(block.lock_rate_limiter().is_blocked());
+            assert_eq!(
+                block.lock_rate_limiter().bandwidth().unwrap().budget(),
+                bytes - 512
+            );
+            assert_eq!(block.lock_rate_limiter().ops().unwrap().budget(), ops - 1);
+            assert_eq!(block.metrics.rate_limiter_throttled_events.count(), 1);
+            // Consume the software notification for the completion already handled above.
+            block.resources()[0]
+                .disk
+                .file_engine
+                .completion_evt()
+                .unwrap()
+                .read()
+                .unwrap();
+
+            clock.advance(Duration::from_millis(100));
+            block.process_rate_limiter_event();
+            assert!(!block.lock_rate_limiter().is_blocked());
+            assert!(block.resources()[0].disk.file_engine.is_busy());
+            assert_eq!(block.resources()[0].queue.next_avail.0, 2);
+            assert_eq!(vq.used.idx.get(), 1);
+            assert_eq!(epoll.wait(1000, &mut events).unwrap(), 1);
+            block.process_async_completion_event();
+            assert!(!block.resources()[0].disk.file_engine.is_busy());
+            // Only the exhausted bucket refills. The other retains exactly one request's
+            // budget, so accepting the second request exhausts both buckets in either case.
+            assert_eq!(block.lock_rate_limiter().bandwidth().unwrap().budget(), 0);
+            assert_eq!(block.lock_rate_limiter().ops().unwrap().budget(), 0);
+            assert_eq!(block.metrics.rate_limiter_throttled_events.count(), 1);
+            assert_eq!(vq.used.idx.get(), 2);
+            for (index, head, status) in [(0, 0, 0x3000), (1, 3, 0x6000)] {
+                assert_eq!(vq.used.ring[index].get().id, head);
+                assert_eq!(vq.used.ring[index].get().len, 1);
+                assert_eq!(
+                    u32::from(mem.read_obj::<u8>(GuestAddress(status)).unwrap()),
+                    VIRTIO_BLK_S_OK
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_bandwidth_rate_limiter() {
         for engine in [FileEngineType::Sync, FileEngineType::Async] {
             let mut block = default_block(engine);
@@ -2954,29 +3335,31 @@ mod tests {
         use crate::devices::virtio::block::virtio::test_utils::default_config;
 
         let file = create_test_qcow2();
-        for read_only in [false, true] {
-            for num_queues in [None, NonZeroU16::new(1), NonZeroU16::new(2)] {
-                let mut config = default_config(
-                    file.as_path().to_str().unwrap().to_string(),
-                    FileEngineType::Sync,
-                );
-                config.image_format = DiskImageFormat::Qcow2;
-                config.is_read_only = read_only;
-                config.num_queues = num_queues;
-                let result = VirtioBlock::new(config);
-                if !read_only && num_queues == NonZeroU16::new(2) {
-                    assert!(matches!(
-                        result,
-                        Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
-                            block_io::Qcow2IoError::MultiQueueNotSupported
-                        )))
-                    ));
-                } else {
-                    let block = result.unwrap();
-                    assert_eq!(
-                        block.num_queues(),
-                        num_queues.map_or(1, |n| usize::from(n.get()))
-                    );
+        for engine in [FileEngineType::Sync, FileEngineType::Async] {
+            for read_only in [false, true] {
+                for num_queues in [None, NonZeroU16::new(1), NonZeroU16::new(2)] {
+                    let mut config =
+                        default_config(file.as_path().to_str().unwrap().to_string(), engine);
+                    config.image_format = DiskImageFormat::Qcow2;
+                    config.is_read_only = read_only;
+                    config.num_queues = num_queues;
+                    let result = VirtioBlock::new(config);
+                    if (!read_only || engine == FileEngineType::Async)
+                        && num_queues == NonZeroU16::new(2)
+                    {
+                        assert!(matches!(
+                            result,
+                            Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
+                                block_io::Qcow2IoError::MultiQueueNotSupported
+                            )))
+                        ));
+                    } else {
+                        let block = result.unwrap();
+                        assert_eq!(
+                            block.num_queues(),
+                            num_queues.map_or(1, |n| usize::from(n.get()))
+                        );
+                    }
                 }
             }
         }

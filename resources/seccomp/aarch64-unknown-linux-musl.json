@@ -1880,6 +1880,19 @@
                 ]
             },
             {
+                "syscall": "fcntl",
+                "comment": "Preserve the io_uring completion event during QCOW2 drive patch",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1030,
+                        "comment": "F_DUPFD_CLOEXEC"
+                    }
+                ]
+            },
+            {
                 "syscall": "fstat",
                 "comment": "Used by disk update"
             }

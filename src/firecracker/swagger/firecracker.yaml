@@ -1344,7 +1344,7 @@ definitions:
         description:
           Enables virtio-blk discard support. When enabled, the guest can issue
           discard/TRIM requests for this drive. Only supported for writable
-          virtio-block devices using the Sync IO engine.
+          virtio-block devices using raw images with Sync, or Qcow2 images with Sync or Async.
           This field is optional for virtio-block config and should be omitted for vhost-user-block configuration.
         default: false
       num_queues:
@@ -1377,15 +1377,17 @@ definitions:
         description:
           Format of the file at path_on_host. "Vmdk" and "Qcow2" support is in
           developer preview. "Vmdk" images must be opened
-          read-only. "Vmdk" and "Qcow2" images require the Sync IO engine.
+          read-only and require the Sync IO engine. "Qcow2" images support Sync and Async.
           "Qcow2" images must be self-contained
           and unencrypted. Compressed clusters
           must use deflate. Extended L2 entries are unsupported.
           Writable v2/v3 "Qcow2" images support discard with zero readback.
+          Qcow2 Async serializes guest requests and uses io_uring for ordinary data reads and writes.
+          Metadata operations, compressed reads, flush and discard are synchronous.
           Physical reclamation depends on host hole-punch support, alignment and remaining references.
-          Writable "Qcow2" images support only one queue and require exclusive access.
+          Writable "Qcow2" images require exclusive access. Writable images and Qcow2 Async support only one queue.
           Resizing a "Qcow2" drive requires PATCH to a different image file.
-          Read-only "Qcow2" images may use multiple queues, but cannot be replaced with PATCH in that configuration.
+          Read-only "Qcow2" images using Sync may use multiple queues, but cannot be replaced with PATCH in that configuration.
           This field is optional for virtio-block config and should be omitted for vhost-user-block configuration.
         enum: ["Raw", "Vmdk", "Qcow2"]
         default: "Raw"

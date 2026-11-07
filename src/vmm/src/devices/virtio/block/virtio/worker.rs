@@ -93,18 +93,6 @@ pub(crate) enum FlushMode {
     DrainAndFlush,
 }
 
-macro_rules! unwrap_async_file_engine_or_return {
-    ($file_engine: expr) => {
-        match $file_engine {
-            FileEngine::Async(engine) => engine,
-            FileEngine::Sync(_) | FileEngine::Vmdk(_) | FileEngine::Qcow2(_) => {
-                error!("The block device doesn't use an async IO engine");
-                return;
-            }
-        }
-    };
-}
-
 impl BlockWorker {
     /// Process a single event in the Virtio queue.
     ///
@@ -135,6 +123,11 @@ impl BlockWorker {
         let mut used_any = false;
 
         while let Some(head) = queue.pop_or_enable_notification()? {
+            if self.resources.disk.file_engine.is_busy() {
+                queue.undo_pop();
+                self.resources.is_io_engine_throttled = true;
+                break;
+            }
             self.metrics.remaining_reqs_count.add(queue.len().into());
             let processing_result =
                 match Request::parse(&head, &self.active_state.mem, self.resources.disk.nsectors) {
@@ -202,9 +195,7 @@ impl BlockWorker {
                 });
         }
 
-        if let FileEngine::Async(ref mut engine) = self.resources.disk.file_engine
-            && let Err(err) = engine.kick_submission_queue()
-        {
+        if let Err(err) = self.resources.disk.file_engine.kick_submission_queue() {
             error!("BlockError submitting pending block requests: {:?}", err);
         }
 
@@ -220,30 +211,22 @@ impl BlockWorker {
             return;
         }
 
-        let engine = unwrap_async_file_engine_or_return!(&mut self.resources.disk.file_engine);
+        let engine = &mut self.resources.disk.file_engine;
         let queue = &mut self.resources.queue;
 
         loop {
             match engine.pop(&self.active_state.mem) {
                 Err(error) => {
-                    error!("Failed to read completed io_uring entry: {:?}", error);
+                    error!("Failed to read completed block request: {:?}", error);
                     break;
                 }
                 Ok(None) => break,
-                Ok(Some(cqe)) => {
-                    let res = cqe.result();
-                    let user_data = cqe.user_data();
-
-                    let (pending, res) = match res {
-                        Ok(count) => (user_data, Ok(count)),
-                        Err(error) => (
-                            user_data,
-                            Err(IoErr::FileEngine(BlockIoError::Async(
-                                async_io::AsyncIoError::IO(error),
-                            ))),
-                        ),
-                    };
-                    let finished = pending.finish(&self.active_state.mem, res, &self.metrics);
+                Ok(Some((pending, result))) => {
+                    let finished = pending.finish(
+                        &self.active_state.mem,
+                        result.map_err(IoErr::FileEngine),
+                        &self.metrics,
+                    );
                     queue
                         .add_used(finished.desc_idx, finished.num_bytes_to_mem)
                         .unwrap_or_else(|err| {
@@ -268,14 +251,17 @@ impl BlockWorker {
     }
 
     pub(crate) fn process_async_completion_event(&mut self) {
-        let engine = unwrap_async_file_engine_or_return!(&mut self.resources.disk.file_engine);
+        let Some(event) = self.resources.disk.file_engine.completion_evt() else {
+            error!("The block device doesn't use an async IO engine");
+            return;
+        };
 
-        if let Err(err) = engine.completion_evt().read() {
+        if let Err(err) = event.read() {
             error!("Failed to get async completion event: {:?}", err);
         } else {
             self.process_async_completion_queue();
 
-            if self.resources.is_io_engine_throttled {
+            if self.resources.is_io_engine_throttled && !self.resources.disk.file_engine.is_busy() {
                 self.resources.is_io_engine_throttled = false;
                 self.process_queue().unwrap()
             }
@@ -301,6 +287,11 @@ impl BlockWorker {
             FlushMode::Drain => self.resources.disk.file_engine.drain(false),
             FlushMode::DrainAndFlush => self.resources.disk.file_engine.drain_and_flush(false),
         };
+        if matches!(&self.resources.disk.file_engine, FileEngine::Qcow2(_)) {
+            // A failed flush still leaves accepted requests ready for guest completion.
+            self.process_async_completion_queue();
+            self.resources.is_io_engine_throttled = self.resources.disk.file_engine.is_busy();
+        }
         match result {
             Ok(()) => {}
             Err(BlockIoError::Async(async_io::AsyncIoError::SyncAll(err))) => {
@@ -327,8 +318,26 @@ impl BlockWorker {
         disk_image_path: String,
         read_only: bool,
     ) -> Result<u64, VirtioBlockError> {
-        self.resources.disk.update(disk_image_path, read_only)?;
-        Ok(self.resources.disk.nsectors)
+        let qcow2_async = matches!(&self.resources.disk.file_engine, FileEngine::Qcow2(_))
+            && self.resources.disk.file_engine.completion_evt().is_some();
+        let result = if qcow2_async {
+            let drained = self.resources.disk.file_engine.drain(false);
+            self.process_async_completion_queue();
+            drained.map_err(VirtioBlockError::FileEngine)
+        } else {
+            Ok(())
+        }
+        .and_then(|()| self.resources.disk.update(disk_image_path, read_only));
+        if qcow2_async && self.resources.is_io_engine_throttled {
+            self.resources.is_io_engine_throttled = self.resources.disk.file_engine.is_busy();
+            if !self.resources.is_io_engine_throttled && !self.is_blocked.load(Ordering::Relaxed) {
+                self.resources
+                    .queue_evt
+                    .write(1)
+                    .map_err(VirtioBlockError::EventFd)?;
+            }
+        }
+        result.map(|()| self.resources.disk.nsectors)
     }
 }
 
@@ -486,9 +495,9 @@ impl ThreadedWorker {
             EventSet::IN,
         ))
         .expect("Failed to register queue event");
-        if let FileEngine::Async(ref engine) = resources.disk.file_engine {
+        if let Some(event) = resources.disk.file_engine.completion_evt() {
             ops.add(Events::with_data(
-                engine.completion_evt(),
+                event,
                 Self::PROCESS_ASYNC_COMPLETION,
                 EventSet::IN,
             ))
@@ -503,9 +512,9 @@ impl ThreadedWorker {
             EventSet::IN,
         ))
         .expect("Failed to unregister queue event");
-        if let FileEngine::Async(ref engine) = resources.disk.file_engine {
+        if let Some(event) = resources.disk.file_engine.completion_evt() {
             ops.remove(Events::with_data(
-                engine.completion_evt(),
+                event,
                 Self::PROCESS_ASYNC_COMPLETION,
                 EventSet::IN,
             ))

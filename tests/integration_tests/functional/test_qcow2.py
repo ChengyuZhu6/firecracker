@@ -26,6 +26,12 @@ DISK_SIZE = 4 * 1024 * 1024
 GUEST_DATA = "/dev/shm/qcow2-data"
 
 
+@pytest.fixture(autouse=True)
+def qcow2_functional_api_checks(microvm_factory):
+    """Judge functional requests by their results and data, allowing slow storage."""
+    microvm_factory.kwargs["time_api_requests"] = False
+
+
 def _convert(source, target, *, compressed=False, compat="1.1", options=""):
     """Generate a self-contained image without using the implementation under test."""
     check_output(
@@ -128,7 +134,7 @@ def _deny_storage_syscall(vm, syscall="fsync"):
 
 @pytest.mark.parametrize("syscall", ["fsync", "fallocate"])
 @pytest.mark.parametrize("compat", ["0.10", "1.1"], ids=["v2", "v3"])
-def test_qcow2_discard_storage_failure(uvm, num_queues, compat, syscall):
+def test_qcow2_discard_storage_failure(uvm, io_engine, num_queues, compat, syscall):
     """Storage failures preserve unrelated data and retain a usable discard queue."""
     _deny_storage_syscall(uvm, syscall)
     uvm.spawn()
@@ -139,6 +145,7 @@ def test_qcow2_discard_storage_failure(uvm, num_queues, compat, syscall):
         "qcow2",
         image,
         image_format="Qcow2",
+        io_engine=io_engine,
         num_queues=num_queues,
         cache_type="Writeback",
         discard=True,
@@ -174,16 +181,25 @@ def test_qcow2_discard_storage_failure(uvm, num_queues, compat, syscall):
         assert json.loads(result.stdout).get("corruptions", 0) == 0
 
 
-def _assert_queue_mode(vm, num_queues, drive_id="qcow2"):
+def _assert_queue_mode(vm, num_queues, drive_id="qcow2", *, io_engine=None):
     assert (f"fc_q0_{drive_id}" in get_threads(vm.firecracker_pid)) == (
         num_queues is not None
     )
+    if io_engine is not None:
+        drive = next(
+            drive
+            for drive in vm.api.vm_config.get().json()["drives"]
+            if drive["drive_id"] == drive_id
+        )
+        assert drive["io_engine"] == io_engine
 
 
 @pytest.mark.parametrize("compat", ["0.10", "1.1"], ids=["v2", "v3"])
 @pytest.mark.parametrize("compressed", [False, True])
 @pytest.mark.parametrize("internal_snapshot", [False, True])
-def test_qcow2_discard_io(uvm, num_queues, compat, compressed, internal_snapshot):
+def test_qcow2_discard_io(
+    uvm, io_engine, num_queues, compat, compressed, internal_snapshot
+):
     """Discard exact ranges, reclaim physical storage, and preserve internal snapshots."""
     uvm.spawn()
     uvm.basic_config()
@@ -196,11 +212,13 @@ def test_qcow2_discard_io(uvm, num_queues, compat, compressed, internal_snapshot
         "qcow2",
         image,
         image_format="Qcow2",
+        io_engine=io_engine,
         num_queues=num_queues,
         cache_type="Writeback",
         discard=True,
     )
     uvm.start()
+    _assert_queue_mode(uvm, num_queues, io_engine=io_engine)
     _, stdout, _ = uvm.ssh.check_output("cat /sys/block/vdb/queue/discard_max_bytes")
     assert int(stdout) > 0
     _write_pattern(uvm, expected, 4 * CLUSTER_SIZE, 16 * CLUSTER_SIZE, 73)
@@ -234,7 +252,7 @@ def test_qcow2_discard_io(uvm, num_queues, compat, compressed, internal_snapshot
 
 
 @pytest.mark.parametrize("compat", ["0.10", "1.1"], ids=["v2", "v3"])
-def test_qcow2_discard_restore(uvm, microvm_factory, num_queues, compat):
+def test_qcow2_discard_restore(uvm, microvm_factory, io_engine, num_queues, compat):
     """Full and differential snapshots restore the negotiated discard feature."""
     uvm.spawn()
     uvm.basic_config(track_dirty_pages=True)
@@ -244,6 +262,7 @@ def test_qcow2_discard_restore(uvm, microvm_factory, num_queues, compat):
         "qcow2",
         image,
         image_format="Qcow2",
+        io_engine=io_engine,
         num_queues=num_queues,
         cache_type="Writeback",
         discard=True,
@@ -257,6 +276,7 @@ def test_qcow2_discard_restore(uvm, microvm_factory, num_queues, compat):
     restored = microvm_factory.build(pci=uvm.pci_enabled)
     restored.spawn()
     restored.restore_from_snapshot(full, resume=True)
+    _assert_queue_mode(restored, num_queues, io_engine=io_engine)
     _assert_guest_data(restored, expected)
     base = restored.snapshot_full(mem_path="base_mem", vmstate_path="base_state")
     restored.resume()
@@ -273,6 +293,7 @@ def test_qcow2_discard_restore(uvm, microvm_factory, num_queues, compat):
     resumed = microvm_factory.build(pci=uvm.pci_enabled)
     resumed.spawn()
     resumed.restore_from_snapshot(snapshot, resume=True)
+    _assert_queue_mode(resumed, num_queues, io_engine=io_engine)
     _assert_guest_data(resumed, expected)
     resumed.ssh.check_output(f"blkdiscard -f -o {DISK_SIZE - 512} -l 512 /dev/vdb")
     expected[-512:] = bytes(512)
@@ -307,7 +328,7 @@ def _assert_readonly_multiqueue(vm, expected):
 
 @pytest.mark.parametrize("compressed", [False, True])
 @pytest.mark.parametrize("compat", ["0.10", "1.1"], ids=["v2", "v3"])
-def test_qcow2_writable_io(uvm, num_queues, compressed, compat):
+def test_qcow2_writable_io(uvm, io_engine, num_queues, compressed, compat):
     """Direct writes preserve v2/v3 ordinary and compressed images across partial-cluster COW."""
     uvm.spawn()
     uvm.basic_config()
@@ -317,11 +338,12 @@ def test_qcow2_writable_io(uvm, num_queues, compressed, compat):
         "qcow2",
         image,
         image_format="Qcow2",
+        io_engine=io_engine,
         num_queues=num_queues,
         cache_type="Writeback",
     )
     uvm.start()
-    _assert_queue_mode(uvm, num_queues)
+    _assert_queue_mode(uvm, num_queues, io_engine=io_engine)
     _, stdout, _ = uvm.ssh.check_output("blockdev --getsize64 /dev/vdb")
     assert int(stdout) == DISK_SIZE
     _assert_guest_data(uvm, expected)
@@ -340,7 +362,7 @@ def test_qcow2_writable_io(uvm, num_queues, compressed, compat):
     _check_closed_image(image, expected)
 
 
-def test_qcow2_live_truncation(uvm, num_queues):
+def test_qcow2_live_truncation(uvm, io_engine, num_queues):
     """Missing allocated bytes fail guest I/O without changing valid or sparse reads."""
     uvm.spawn()
     uvm.basic_config()
@@ -356,9 +378,11 @@ def test_qcow2_live_truncation(uvm, num_queues):
     )
     assert tail["data"] and tail["present"]
     host_offset = tail["offset"] + DISK_SIZE - 512 - tail["start"]
-    uvm.add_drive("qcow2", image, image_format="Qcow2", num_queues=num_queues)
+    uvm.add_drive(
+        "qcow2", image, image_format="Qcow2", io_engine=io_engine, num_queues=num_queues
+    )
     uvm.start()
-    _assert_queue_mode(uvm, num_queues)
+    _assert_queue_mode(uvm, num_queues, io_engine=io_engine)
     _assert_guest_data(uvm, expected)
 
     for remaining in [511, 0]:
@@ -379,8 +403,66 @@ def test_qcow2_live_truncation(uvm, num_queues):
         )
         assert stdout.split()[0] == _digest(bytes(512))
 
+    # An I/O error must leave the queue able to allocate and read another cluster.
+    offset = 8 * CLUSTER_SIZE
+    _write_pattern(uvm, expected, offset, 4096, 97)
+    _, stdout, _ = uvm.ssh.check_output(
+        f"dd if=/dev/vdb bs=512 skip={offset // 512} count=8"
+        " iflag=direct status=none | sha256sum"
+    )
+    assert stdout.split()[0] == _digest(expected[offset : offset + 4096])
 
-def test_qcow2_unclean_shutdown(uvm, num_queues):
+
+def test_qcow2_parallel_writes_flush_and_discard(uvm, io_engine, num_queues):
+    """Concurrent partial-cluster writes survive flush, discard, and subsequent reuse."""
+    uvm.spawn()
+    uvm.basic_config()
+    uvm.add_net_iface()
+    image, expected = _image(uvm, "parallel", compressed=True)
+    uvm.add_drive(
+        "qcow2",
+        image,
+        image_format="Qcow2",
+        io_engine=io_engine,
+        num_queues=num_queues,
+        cache_type="Writeback",
+        discard=True,
+    )
+    uvm.start()
+    _assert_queue_mode(uvm, num_queues, io_engine=io_engine)
+    payload = bytes(index % 251 + 1 for index in range(CLUSTER_SIZE))
+    source = Path(uvm.fsfiles) / "qcow2-parallel.bin"
+    source.write_bytes(payload)
+    uvm.ssh.scp_put(str(source), "/dev/shm/qcow2-parallel")
+
+    # Separate writes fill one compressed cluster, then one previously sparse cluster.
+    for offset in [0, 8 * CLUSTER_SIZE]:
+        commands = []
+        for index in range(4):
+            commands.append(
+                "dd if=/dev/shm/qcow2-parallel of=/dev/vdb bs=16384"
+                f" skip={index} seek={offset // 16384 + index} count=1"
+                f" oflag=direct conv=notrunc status=none & p{index}=$!"
+            )
+        commands.append(
+            'wait "$p0" && wait "$p1" && wait "$p2" && wait "$p3"'
+            " && blockdev --flushbufs /dev/vdb"
+        )
+        uvm.ssh.check_output("; ".join(commands))
+        expected[offset : offset + CLUSTER_SIZE] = payload
+        _assert_guest_data(uvm, expected)
+
+    offset = 8 * CLUSTER_SIZE
+    uvm.ssh.check_output(f"blkdiscard -f -o {offset} -l {CLUSTER_SIZE} /dev/vdb")
+    expected[offset : offset + CLUSTER_SIZE] = bytes(CLUSTER_SIZE)
+    _assert_guest_data(uvm, expected)
+    _write_pattern(uvm, expected, offset + 512, 4096, 83)
+    _assert_guest_data(uvm, expected)
+    uvm.kill()
+    _check_closed_image(image, expected)
+
+
+def test_qcow2_unclean_shutdown(uvm, io_engine, num_queues):
     """Published L2 tables retain their refcounts after Firecracker is killed."""
     image = Path(uvm.fsfiles) / "unclean.qcow2"
     check_output(
@@ -398,7 +480,9 @@ def test_qcow2_unclean_shutdown(uvm, num_queues):
     uvm.spawn()
     uvm.basic_config()
     uvm.add_net_iface()
-    uvm.add_drive("qcow2", image, image_format="Qcow2", num_queues=num_queues)
+    uvm.add_drive(
+        "qcow2", image, image_format="Qcow2", io_engine=io_engine, num_queues=num_queues
+    )
     uvm.start()
     expected = bytearray(DISK_SIZE)
     for offset in (512, 2 * 1024 * 1024 - 512, 3 * 1024 * 1024):
@@ -415,7 +499,9 @@ def test_qcow2_unclean_shutdown(uvm, num_queues):
 @pin_pci(True)
 @pytest.mark.parametrize("cache_type", ["Unsafe", "Writeback"])
 @pytest.mark.parametrize("force", [False, True], ids=["graceful", "forced"])
-def test_qcow2_pci_unplug(uvm, microvm_factory, num_queues, cache_type, force):
+def test_qcow2_pci_unplug(
+    uvm, microvm_factory, io_engine, num_queues, cache_type, force
+):
     """Unplug flushes dirty mappings and releases locks before and after restore."""
     uvm.spawn()
     uvm.basic_config(pcie_hotplug_ports=1)
@@ -429,6 +515,7 @@ def test_qcow2_pci_unplug(uvm, microvm_factory, num_queues, cache_type, force):
             "qcow2",
             image,
             image_format="Qcow2",
+            io_engine=io_engine,
             num_queues=num_queues,
             cache_type=cache_type,
             discard=True,
@@ -437,9 +524,11 @@ def test_qcow2_pci_unplug(uvm, microvm_factory, num_queues, cache_type, force):
             stop=stop_after_delay(10), wait=wait_fixed(0.1), reraise=True
         ):
             with attempt:
-                rc, _, _ = vm.ssh.run("test -b /dev/vdb")
+                rc, _, _ = vm.ssh.run(
+                    "dd if=/dev/vdb of=/dev/null bs=512 count=1 iflag=direct status=none"
+                )
                 assert rc == 0
-        _assert_queue_mode(vm, num_queues)
+        _assert_queue_mode(vm, num_queues, io_engine=io_engine)
         _assert_guest_data(vm, expected)
         _write_pattern(vm, expected, 6 * CLUSTER_SIZE + 512, 4096, 73, flush=False)
         vm.ssh.check_output(f"blkdiscard -f -o 512 -l {CLUSTER_SIZE} /dev/vdb")
@@ -451,7 +540,7 @@ def test_qcow2_pci_unplug(uvm, microvm_factory, num_queues, cache_type, force):
             vm.kill()
             vm = microvm_factory.build_from_snapshot(snapshot)
             image = Path(vm.chroot()) / Path(vm.disks["qcow2"]).name
-            _assert_queue_mode(vm, num_queues)
+            _assert_queue_mode(vm, num_queues, io_engine=io_engine)
             _assert_guest_data(vm, expected)
             _write_pattern(
                 vm, expected, 10 * CLUSTER_SIZE + 512, 4096, 131, flush=False
@@ -476,7 +565,7 @@ def test_qcow2_pci_unplug(uvm, microvm_factory, num_queues, cache_type, force):
         _check_closed_image(image, expected)
 
 
-def test_qcow2_snapshot_sync_failure(uvm, num_queues):
+def test_qcow2_snapshot_sync_failure(uvm, io_engine, num_queues):
     """A failed disk sync rejects snapshots without losing the paused device or its data."""
     _deny_storage_syscall(uvm)
     uvm.spawn()
@@ -487,12 +576,13 @@ def test_qcow2_snapshot_sync_failure(uvm, num_queues):
         "qcow2",
         image,
         image_format="Qcow2",
+        io_engine=io_engine,
         num_queues=num_queues,
         cache_type="Writeback",
     )
     uvm.api.vsock.put(vsock_id="vsock0", guest_cid=3, uds_path="/" + VSOCK_UDS_PATH)
     uvm.start()
-    _assert_queue_mode(uvm, num_queues)
+    _assert_queue_mode(uvm, num_queues, io_engine=io_engine)
     uds_path = start_guest_echo_server(uvm)
     with vsock_connect_to_guest(uds_path, ECHO_SERVER_PORT) as connection:
         connection.settimeout(5)
@@ -528,7 +618,7 @@ def test_qcow2_snapshot_sync_failure(uvm, num_queues):
 @pin_guest_kernel(ACPI_GUEST_KERNELS)
 @pin_pci(True)
 @pytest.mark.parametrize("vm_backend", ["kvm"], indirect=True)
-def test_qcow2_force_unplug_sync_failure(uvm, num_queues):
+def test_qcow2_force_unplug_sync_failure(uvm, io_engine, num_queues):
     """A failed forced unplug retains the running device, its lock, and usable queues."""
     _deny_storage_syscall(uvm)
     uvm.spawn()
@@ -540,6 +630,7 @@ def test_qcow2_force_unplug_sync_failure(uvm, num_queues):
         "qcow2",
         image,
         image_format="Qcow2",
+        io_engine=io_engine,
         num_queues=num_queues,
         cache_type="Writeback",
     )
@@ -549,7 +640,7 @@ def test_qcow2_force_unplug_sync_failure(uvm, num_queues):
         with attempt:
             rc, _, _ = uvm.ssh.run("test -b /dev/vdb")
             assert rc == 0
-    _assert_queue_mode(uvm, num_queues)
+    _assert_queue_mode(uvm, num_queues, io_engine=io_engine)
     _write_pattern(uvm, expected, 6 * CLUSTER_SIZE + 512, 4096, 73, flush=False)
     config = uvm.api.vm_config.get().json()
     assert uvm.state == "Running"
@@ -562,7 +653,7 @@ def test_qcow2_force_unplug_sync_failure(uvm, num_queues):
             uvm.api.drive.delete("qcow2", force=True)
         assert uvm.state == "Running"
         assert uvm.api.vm_config.get().json() == config
-        _assert_queue_mode(uvm, num_queues)
+        _assert_queue_mode(uvm, num_queues, io_engine=io_engine)
         with image.open("rb") as probe:
             with pytest.raises(BlockingIOError):
                 fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -575,7 +666,9 @@ def test_qcow2_force_unplug_sync_failure(uvm, num_queues):
 
 
 @pytest.mark.parametrize("cache_type", ["Unsafe", "Writeback"])
-def test_qcow2_full_and_diff_snapshot(uvm, microvm_factory, num_queues, cache_type):
+def test_qcow2_full_and_diff_snapshot(
+    uvm, microvm_factory, io_engine, num_queues, cache_type
+):
     """Full and diff restoration preserve disk data, dirty guest reads, and writable I/O."""
     uvm.spawn()
     uvm.basic_config(track_dirty_pages=True)
@@ -585,6 +678,7 @@ def test_qcow2_full_and_diff_snapshot(uvm, microvm_factory, num_queues, cache_ty
         "qcow2",
         image,
         image_format="Qcow2",
+        io_engine=io_engine,
         num_queues=num_queues,
         cache_type=cache_type,
     )
@@ -598,7 +692,7 @@ def test_qcow2_full_and_diff_snapshot(uvm, microvm_factory, num_queues, cache_ty
     restored = microvm_factory.build(pci=uvm.pci_enabled)
     restored.spawn()
     restored.restore_from_snapshot(full, resume=True)
-    _assert_queue_mode(restored, num_queues)
+    _assert_queue_mode(restored, num_queues, io_engine=io_engine)
     _, stdout, _ = restored.ssh.check_output(f"sha256sum {GUEST_DATA}")
     assert stdout.split()[0] == _digest(expected)
     _assert_guest_data(restored, expected)
@@ -623,7 +717,7 @@ def test_qcow2_full_and_diff_snapshot(uvm, microvm_factory, num_queues, cache_ty
     resumed = microvm_factory.build(pci=uvm.pci_enabled)
     resumed.spawn()
     resumed.restore_from_snapshot(snapshot, resume=True)
-    _assert_queue_mode(resumed, num_queues)
+    _assert_queue_mode(resumed, num_queues, io_engine=io_engine)
     _, stdout, _ = resumed.ssh.check_output(f"sha256sum {GUEST_DATA}")
     assert stdout.split()[0] == _digest(expected)
     _assert_guest_data(resumed, expected)
@@ -634,7 +728,7 @@ def test_qcow2_full_and_diff_snapshot(uvm, microvm_factory, num_queues, cache_ty
     _check_closed_image(image, expected)
 
 
-def test_qcow2_patch_dirty_image(uvm, microvm_factory, num_queues):
+def test_qcow2_patch_dirty_image(uvm, microvm_factory, io_engine, num_queues):
     """PATCH keeps dirty state on no-op/error and flushes the old image before replacing it."""
     uvm.spawn()
     uvm.basic_config()
@@ -659,6 +753,7 @@ def test_qcow2_patch_dirty_image(uvm, microvm_factory, num_queues):
                 "malformed",
                 malformed,
                 image_format="Qcow2",
+                io_engine=io_engine,
                 is_read_only=read_only,
             )
         assert malformed.read_bytes() == malformed_data
@@ -666,6 +761,7 @@ def test_qcow2_patch_dirty_image(uvm, microvm_factory, num_queues):
         "qcow2",
         original,
         image_format="Qcow2",
+        io_engine=io_engine,
         num_queues=num_queues,
         cache_type="Writeback",
     )
@@ -676,6 +772,7 @@ def test_qcow2_patch_dirty_image(uvm, microvm_factory, num_queues):
         drive_id="qcow2", path_on_host=uvm.create_jailed_resource(alias)
     )
     assert get_threads(uvm.firecracker_pid).get("fc_q0_qcow2") == threads
+    _assert_queue_mode(uvm, num_queues, io_engine=io_engine)
     _assert_guest_data(uvm, original_data)
 
     for rejected in [invalid, malformed]:
@@ -683,6 +780,7 @@ def test_qcow2_patch_dirty_image(uvm, microvm_factory, num_queues):
             uvm.api.drive.patch(
                 drive_id="qcow2", path_on_host=uvm.create_jailed_resource(rejected)
             )
+        _assert_queue_mode(uvm, num_queues, io_engine=io_engine)
         _assert_guest_data(uvm, original_data)
     assert malformed.read_bytes() == malformed_data
     _write_pattern(uvm, original_data, 10 * CLUSTER_SIZE - 512, 8192, 41, flush=False)
@@ -696,7 +794,7 @@ def test_qcow2_patch_dirty_image(uvm, microvm_factory, num_queues):
         with attempt:
             _, stdout, _ = uvm.ssh.check_output("blockdev --getsize64 /dev/vdb")
             assert int(stdout) == len(replacement_data)
-    _assert_queue_mode(uvm, num_queues)
+    _assert_queue_mode(uvm, num_queues, io_engine=io_engine)
     _assert_guest_data(uvm, replacement_data)
     _write_pattern(uvm, replacement_data, len(replacement_data) - 512, 512, 67)
     _assert_guest_data(uvm, replacement_data)
@@ -705,6 +803,7 @@ def test_qcow2_patch_dirty_image(uvm, microvm_factory, num_queues):
     _check_closed_image(original, original_data)
     _check_closed_image(replacement, replacement_data)
     restored = microvm_factory.build_from_snapshot(snapshot)
+    _assert_queue_mode(restored, num_queues, io_engine=io_engine)
     _, stdout, _ = restored.ssh.check_output("blockdev --getsize64 /dev/vdb")
     assert int(stdout) == len(replacement_data)
     _assert_guest_data(restored, replacement_data)
@@ -718,7 +817,7 @@ def test_qcow2_patch_dirty_image(uvm, microvm_factory, num_queues):
 @pytest.mark.parametrize(
     "feature", ["backing", "external", "encrypted", "extended-l2", "zstd"]
 )
-def test_qcow2_rejects_unsupported_images(uvm, num_queues, feature):
+def test_qcow2_rejects_unsupported_images(uvm, io_engine, num_queues, feature):
     """PUT and live PATCH reject unsupported QEMU images without modifying their files."""
     uvm.spawn()
     uvm.basic_config()
@@ -772,7 +871,11 @@ def test_qcow2_rejects_unsupported_images(uvm, num_queues, feature):
     for read_only in [False, True]:
         with pytest.raises(RuntimeError, match=error):
             uvm.add_drive(
-                "rejected", image, image_format="Qcow2", is_read_only=read_only
+                "rejected",
+                image,
+                image_format="Qcow2",
+                io_engine=io_engine,
+                is_read_only=read_only,
             )
         assert uvm.api.vm_config.get().json() == config
         with image.open("rb") as probe:
@@ -781,6 +884,7 @@ def test_qcow2_rejects_unsupported_images(uvm, num_queues, feature):
         "qcow2",
         original,
         image_format="Qcow2",
+        io_engine=io_engine,
         num_queues=num_queues,
         cache_type="Writeback",
     )
@@ -794,7 +898,7 @@ def test_qcow2_rejects_unsupported_images(uvm, num_queues, feature):
     assert uvm.api.vm_config.get().json() == config
     with image.open("rb") as probe:
         fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    _assert_queue_mode(uvm, num_queues)
+    _assert_queue_mode(uvm, num_queues, io_engine=io_engine)
     _assert_guest_data(uvm, expected)
     _write_pattern(uvm, expected, 10 * CLUSTER_SIZE + 512, 4096, 71)
     _assert_guest_data(uvm, expected)
@@ -814,12 +918,20 @@ def test_qcow2_readonly_multiqueue_and_invalid_config(uvm, microvm_factory):
     os.link(image, image_alias)
     os.link(writer, writer.with_name("writer-alias.qcow2"))
 
-    for drive_id, options, message in [
-        ("async", {"io_engine": "Async"}, "async file engine"),
-        ("writable_mq", {"num_queues": 2}, "multiple queues"),
-    ]:
-        with pytest.raises(RuntimeError, match=message):
-            uvm.add_drive(drive_id, image, image_format="Qcow2", **options)
+    config = uvm.api.vm_config.get().json()
+    for io_engine, read_only in [("Sync", False), ("Async", False), ("Async", True)]:
+        with pytest.raises(RuntimeError, match="multiple queues|multi-queue"):
+            uvm.add_drive(
+                "rejected",
+                image,
+                image_format="Qcow2",
+                io_engine=io_engine,
+                is_read_only=read_only,
+                num_queues=2,
+            )
+        assert uvm.api.vm_config.get().json() == config
+        with image.open("rb") as probe:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     uvm.add_drive("writer", writer, image_format="Qcow2")
     for read_only in [False, True]:
@@ -857,7 +969,7 @@ def test_qcow2_readonly_multiqueue_and_invalid_config(uvm, microvm_factory):
     _check_closed_image(image, expected)
 
 
-def test_qcow2_root_squashfs_boot(uvm, num_queues):
+def test_qcow2_root_squashfs_boot(uvm, io_engine, num_queues):
     """Boot the real squashfs root from QCOW2 and read its full logical contents directly."""
     image = Path(uvm.fsfiles) / "rootfs.qcow2"
     _convert(uvm.rootfs_file, image)
@@ -870,10 +982,11 @@ def test_qcow2_root_squashfs_boot(uvm, num_queues):
         is_root_device=True,
         is_read_only=True,
         image_format="Qcow2",
+        io_engine=io_engine,
         num_queues=num_queues,
     )
     uvm.start()
-    _assert_queue_mode(uvm, num_queues, drive_id="rootfs")
+    _assert_queue_mode(uvm, num_queues, drive_id="rootfs", io_engine=io_engine)
     expected = uvm.rootfs_file.read_bytes()
     _assert_guest_data(uvm, expected, device="/dev/vda")
     uvm.ssh.check_output("test -r /etc/os-release && test -d /proc/1")
