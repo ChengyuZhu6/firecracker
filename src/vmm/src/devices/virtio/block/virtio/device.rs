@@ -14,7 +14,7 @@ use std::num::NonZeroU16;
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::os::linux::fs::MetadataExt;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use vm_memory::ByteValued;
@@ -67,10 +67,18 @@ pub struct DiskProperties {
 
 impl DiskProperties {
     // Helper function that opens the file with the proper access permissions
-    fn open_file(disk_image_path: &str, is_disk_read_only: bool) -> Result<File, VirtioBlockError> {
-        OpenOptions::new()
-            .read(true)
-            .write(!is_disk_read_only)
+    fn open_file(
+        disk_image_path: &str,
+        is_disk_read_only: bool,
+        image_format: DiskImageFormat,
+    ) -> Result<File, VirtioBlockError> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(!is_disk_read_only);
+        if image_format == DiskImageFormat::Qcow2 {
+            // A FIFO must not block before we can check the opened file's type.
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        options
             .open(PathBuf::from(&disk_image_path))
             .map_err(|x| VirtioBlockError::BackingFile(x, disk_image_path.to_string()))
     }
@@ -121,19 +129,28 @@ impl DiskProperties {
                 let disk_size = vmdk_engine.disk_size();
                 Ok((FileEngine::Vmdk(vmdk_engine), disk_size))
             }
+            DiskImageFormat::Qcow2 => {
+                if file_engine_type == FileEngineType::Async {
+                    return Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
+                        block_io::Qcow2IoError::AsyncNotSupported,
+                    )));
+                }
+
+                let qcow2_engine = block_io::Qcow2FileEngine::from_file(
+                    disk_image,
+                    Path::new(disk_image_path),
+                    is_disk_read_only,
+                )
+                .map_err(|e| VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(e)))?;
+                let disk_size = qcow2_engine.disk_size();
+                Ok((FileEngine::Qcow2(qcow2_engine), disk_size))
+            }
             DiskImageFormat::Raw => {
                 let disk_size = Self::file_size(disk_image_path, &mut disk_image)?;
                 let engine = FileEngine::from_file(disk_image, file_engine_type)
                     .map_err(VirtioBlockError::FileEngine)?;
                 Ok((engine, disk_size))
             }
-        }
-    }
-
-    fn file_engine_type(&self) -> FileEngineType {
-        match self.file_engine {
-            FileEngine::Async(_) => FileEngineType::Async,
-            FileEngine::Sync(_) | FileEngine::Vmdk(_) => FileEngineType::Sync,
         }
     }
 
@@ -144,7 +161,7 @@ impl DiskProperties {
         file_engine_type: FileEngineType,
         image_format: DiskImageFormat,
     ) -> Result<Self, VirtioBlockError> {
-        let disk_image = Self::open_file(disk_image_path, is_disk_read_only)?;
+        let disk_image = Self::open_file(disk_image_path, is_disk_read_only, image_format)?;
         let image_id = Self::build_disk_image_id(&disk_image);
         let (file_engine, disk_size) = Self::from_disk_image(
             disk_image_path,
@@ -167,14 +184,28 @@ impl DiskProperties {
         disk_image_path: String,
         is_disk_read_only: bool,
     ) -> Result<(), VirtioBlockError> {
-        let mut disk_image = Self::open_file(&disk_image_path, is_disk_read_only)?;
+        let image_format = DiskImageFormat::from(&self.file_engine);
+        let mut disk_image = Self::open_file(&disk_image_path, is_disk_read_only, image_format)?;
         let image_id = Self::build_disk_image_id(&disk_image);
+        if let FileEngine::Qcow2(engine) = &self.file_engine {
+            let same_file = engine
+                .same_file(&disk_image)
+                .map_err(|err| VirtioBlockError::BackingFile(err, disk_image_path.clone()))?;
+            // Finish persisting the old image before opening a writable replacement.
+            engine
+                .flush()
+                .map_err(block_io::BlockIoError::Qcow2)
+                .map_err(VirtioBlockError::FileEngine)?;
+            if same_file {
+                self.image_id = image_id;
+                return Ok(());
+            }
+        }
 
         // A raw image is a single file the engine can be pointed at. Formatted images
         // are parsed into engine state when they are opened (for VMDK: the descriptor
         // and its extents), and their size comes from that state rather than from the
         // size of the descriptor file, so the engine has to be rebuilt instead.
-        let image_format = DiskImageFormat::from(&self.file_engine);
         let disk_size = if image_format == DiskImageFormat::Raw {
             let disk_size = Self::file_size(&disk_image_path, &mut disk_image)?;
             self.file_engine
@@ -186,7 +217,7 @@ impl DiskProperties {
                 &disk_image_path,
                 disk_image,
                 is_disk_read_only,
-                self.file_engine_type(),
+                FileEngineType::Sync,
                 image_format,
             )?;
             self.file_engine = file_engine;
@@ -532,10 +563,14 @@ impl VirtioBlock {
         if config.discard && config.file_engine_type == FileEngineType::Async {
             return Err(VirtioBlockError::DiscardAsyncUnsupported);
         }
-
         let num_queues = config
             .num_queues
             .map_or(DEFAULT_BLOCK_NUM_QUEUES, NonZeroU16::get);
+        if config.image_format == DiskImageFormat::Qcow2 && !config.is_read_only && num_queues > 1 {
+            return Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
+                block_io::Qcow2IoError::MultiQueueNotSupported,
+            )));
+        }
         let mut resources = Vec::with_capacity(usize::from(num_queues));
         for queue_idx in 0..num_queues {
             resources.push(BlockResources {
@@ -584,7 +619,10 @@ impl VirtioBlock {
 
         if config.blk_size.is_none()
             && config.topology.is_none()
-            && !matches!(resources[0].disk.file_engine, FileEngine::Vmdk(_))
+            && !matches!(
+                resources[0].disk.file_engine,
+                FileEngine::Vmdk(_) | FileEngine::Qcow2(_)
+            )
         {
             if let Some((blk_size, topology)) =
                 query_blk_attrs(resources[0].disk.file_engine.file())
@@ -713,6 +751,13 @@ impl VirtioBlock {
 
     /// Update the backing file and the config space of the block device.
     pub fn update_disk_image(&mut self, disk_image_path: String) -> Result<(), VirtioBlockError> {
+        if self.config.image_format == DiskImageFormat::Qcow2
+            && self.config.num_queues.is_some_and(|count| count.get() > 1)
+        {
+            return Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
+                block_io::Qcow2IoError::MultiQueuePatchNotSupported,
+            )));
+        }
         let config_path = disk_image_path.clone();
         let read_only = self.config.is_read_only;
         let nsectors = match &mut self.state {
@@ -771,22 +816,30 @@ impl VirtioBlock {
     }
 
     /// Prepare device for being snapshotted.
-    pub fn prepare_save(&mut self) {
+    pub fn prepare_save(&mut self) -> Result<(), crate::devices::virtio::persist::PersistError> {
         match &mut self.state {
-            BlockRuntimeState::Inline(worker) => worker.prepare_save(FlushMode::DrainAndFlush),
+            BlockRuntimeState::Inline(worker) => worker.prepare_save(FlushMode::DrainAndFlush)?,
             BlockRuntimeState::Threaded(active) => {
                 let (last, rest) = active
                     .worker_handles
                     .split_last()
                     .expect("threaded block device must have at least one worker");
                 for handle in rest {
-                    handle.pause(FlushMode::Drain);
+                    handle.pause(FlushMode::Drain)?;
                 }
-                last.pause(FlushMode::DrainAndFlush);
+                last.pause(FlushMode::DrainAndFlush)?;
             }
-            BlockRuntimeState::Configuring(_, _) => {}
+            BlockRuntimeState::Configuring(resources, _) => {
+                // Reset parks the engine with any pending QCOW2 metadata still in memory.
+                for resource in resources {
+                    if let FileEngine::Qcow2(engine) = &resource.disk.file_engine {
+                        engine.flush().map_err(block_io::BlockIoError::Qcow2)?;
+                    }
+                }
+            }
             BlockRuntimeState::Placeholder => unreachable!("not a runtime state"),
         }
+        Ok(())
     }
 
     /// Spawn a parked worker thread for the next activation.
@@ -1089,9 +1142,10 @@ impl VirtioDevice for VirtioBlock {
 
 impl Drop for VirtioBlock {
     fn drop(&mut self) {
-        let flush_mode = match self.config.cache_type {
-            CacheType::Unsafe => FlushMode::Drain,
-            CacheType::Writeback => FlushMode::DrainAndFlush,
+        let flush_mode = match (self.config.image_format, self.config.cache_type) {
+            // Even with Unsafe caching, dropping QCOW2 must publish its in-memory mappings.
+            (DiskImageFormat::Qcow2, _) | (_, CacheType::Writeback) => FlushMode::DrainAndFlush,
+            (_, CacheType::Unsafe) => FlushMode::Drain,
         };
 
         match std::mem::replace(&mut self.state, BlockRuntimeState::Placeholder) {
@@ -1507,6 +1561,60 @@ mod tests {
                 .unwrap(),
             VIRTIO_BLK_S_UNSUPP
         );
+    }
+
+    #[test]
+    fn test_qcow2_discard_request() {
+        use crate::devices::virtio::block::virtio::test_utils::{
+            create_test_qcow2, default_config,
+        };
+
+        let file = create_test_qcow2();
+        let mut config = default_config(
+            file.as_path().to_str().unwrap().to_string(),
+            FileEngineType::Sync,
+        );
+        config.image_format = DiskImageFormat::Qcow2;
+        config.discard = true;
+        config.drive_id = "qcow2_discard_request".to_string();
+        let mut block = VirtioBlock::new(config).unwrap();
+        let mem = default_mem();
+        mem.write_slice(&[0x5a; 1024], GuestAddress(4096)).unwrap();
+        let engine = &mut block.resources_mut()[0].disk.file_engine;
+        let FileEngine::Qcow2(engine) = engine else {
+            unreachable!()
+        };
+        engine.write(0, &mem, GuestAddress(4096), 1024).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        set_queue(&mut block, 0, vq.create_queue());
+        block.set_acked_features(1u64 << VIRTIO_BLK_F_DISCARD);
+        block.activate(mem.clone(), default_interrupt()).unwrap();
+        let chain = RequestDescriptorChain::new(&vq);
+        chain.set_header(RequestHeader::new(VIRTIO_BLK_T_DISCARD, 0));
+        chain.data_desc.flags.set(VIRTQ_DESC_F_NEXT);
+        chain.data_desc.len.set(16);
+        let mut range = [0u8; 16];
+        range[..8].copy_from_slice(&1u64.to_le_bytes());
+        range[8..12].copy_from_slice(&1u32.to_le_bytes());
+        mem.write_slice(&range, GuestAddress(chain.data_desc.addr.get()))
+            .unwrap();
+        simulate_queue_event(&mut block, Some(true));
+        assert_eq!(vq.used.ring[0].get().len, 1);
+        assert_eq!(
+            mem.read_obj::<u8>(GuestAddress(chain.status_desc.addr.get()))
+                .unwrap(),
+            0
+        );
+        let engine = &mut block.resources_mut()[0].disk.file_engine;
+        let FileEngine::Qcow2(engine) = engine else {
+            unreachable!()
+        };
+        engine.read(0, &mem, GuestAddress(4096), 1024).unwrap();
+        let mut actual = [0; 1024];
+        mem.read_slice(&mut actual, GuestAddress(4096)).unwrap();
+        assert_eq!(&actual[..512], &[0x5a; 512]);
+        assert_eq!(&actual[512..], &[0; 512]);
+        engine.flush().unwrap();
     }
 
     #[test]
@@ -2365,7 +2473,7 @@ mod tests {
             // Add a batch of flush requests.
             add_flush_requests_batch(&mut block, &vq, 5);
             simulate_queue_event(&mut block, None);
-            block.prepare_save();
+            block.prepare_save().unwrap();
 
             // Check that all the pending flush requests were processed during `prepare_save()`.
             check_flush_requests_batch(5, &vq);
@@ -2653,14 +2761,14 @@ mod tests {
         // A running worker answers a commit request too.
         block.commit_dirty();
 
-        block.prepare_save();
+        block.prepare_save().unwrap();
         read_blk_req_descriptors(vq);
         vq.dtable[1].len.set(VIRTIO_BLK_ID_BYTES);
         mem.write_obj::<u32>(VIRTIO_BLK_T_GET_ID, GuestAddress(vq.dtable[0].addr.get()))
             .unwrap();
         mem.reset_dirty();
         block.kick();
-        block.prepare_save();
+        block.prepare_save().unwrap();
         assert_eq!(vq.used.idx.get(), 1);
         assert!(!used_ring_dirty(mem, vq));
     }
@@ -2713,7 +2821,7 @@ mod tests {
         set_queue(&mut block, 0, vq.create_queue());
         block.activate(mem.clone(), default_interrupt()).unwrap();
 
-        block.prepare_save();
+        block.prepare_save().unwrap();
         read_blk_req_descriptors(&vq);
         let request_type_addr = GuestAddress(vq.dtable[0].addr.get());
         let status_addr = GuestAddress(vq.dtable[2].addr.get());
@@ -2723,7 +2831,7 @@ mod tests {
 
         block.kick();
         // A second pause waits until the resumed worker has processed its queue.
-        block.prepare_save();
+        block.prepare_save().unwrap();
 
         assert_eq!(vq.used.idx.get(), 1);
         assert_eq!(vq.used.ring[0].get().id, 0);
@@ -2740,7 +2848,7 @@ mod tests {
             set_queue(&mut block, 0, vq.create_queue());
             block.set_acked_features(1);
             block.activate(mem, default_interrupt()).unwrap();
-            block.prepare_save();
+            block.prepare_save().unwrap();
 
             assert!(block.reset());
             assert!(!block.is_activated());
@@ -2767,6 +2875,111 @@ mod tests {
         block.activate(mem, default_interrupt()).unwrap();
 
         block.reset();
+    }
+
+    #[test]
+    fn test_qcow2_rejects_non_regular_files() {
+        use std::ffi::CString;
+        use vmm_sys_util::tempdir::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.as_path().join("disk.qcow2");
+        let filename = CString::new(fifo.to_str().unwrap()).unwrap();
+        // JUSTIFICATION: the standard library has no API for creating a FIFO.
+        // SAFETY: filename is a valid, NUL-terminated pathname.
+        assert_eq!(unsafe { libc::mkfifo(filename.as_ptr(), 0o600) }, 0);
+        assert!(matches!(
+            DiskProperties::new(
+                fifo.to_str().unwrap(),
+                true,
+                FileEngineType::Sync,
+                DiskImageFormat::Qcow2,
+            ),
+            Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
+                block_io::Qcow2IoError::Open(err)
+            ))) if err.kind() == std::io::ErrorKind::InvalidInput
+        ));
+    }
+
+    #[test]
+    fn test_qcow2_persists_parked_engine_on_snapshot_and_drop() {
+        use crate::devices::virtio::block::virtio::test_utils::create_test_qcow2;
+        use crate::devices::virtio::block::virtio::test_utils::default_config;
+
+        for snapshot in [false, true] {
+            let file = create_test_qcow2();
+            let path = file.as_path().to_str().unwrap();
+            let mut config = default_config(path.to_string(), FileEngineType::Sync);
+            config.image_format = DiskImageFormat::Qcow2;
+            let mut block = VirtioBlock::new(config).unwrap();
+
+            let mem = default_mem();
+            let addr = GuestAddress(0);
+            let pattern = [0x6d; 512];
+            mem.write_slice(&pattern, addr).unwrap();
+            let BlockRuntimeState::Configuring(resources, _) = &mut block.state else {
+                unreachable!();
+            };
+            let FileEngine::Qcow2(engine) = &mut resources[0].disk.file_engine else {
+                unreachable!();
+            };
+            engine.write(0, &mem, addr, 512).unwrap();
+
+            let persisted = if snapshot {
+                block.prepare_save().unwrap();
+                let copy = TempFile::new().unwrap();
+                std::fs::copy(file.as_path(), copy.as_path()).unwrap();
+                copy
+            } else {
+                drop(block);
+                file
+            };
+            let mut reader = block_io::Qcow2FileEngine::from_file(
+                File::open(persisted.as_path()).unwrap(),
+                persisted.as_path(),
+                true,
+            )
+            .unwrap();
+            mem.write_slice(&[0; 512], addr).unwrap();
+            reader.read(0, &mem, addr, 512).unwrap();
+            let mut actual = [0; 512];
+            mem.read_slice(&mut actual, addr).unwrap();
+            assert_eq!(actual, pattern);
+        }
+    }
+
+    #[test]
+    fn test_qcow2_num_queues() {
+        use crate::devices::virtio::block::virtio::test_utils::create_test_qcow2;
+        use crate::devices::virtio::block::virtio::test_utils::default_config;
+
+        let file = create_test_qcow2();
+        for read_only in [false, true] {
+            for num_queues in [None, NonZeroU16::new(1), NonZeroU16::new(2)] {
+                let mut config = default_config(
+                    file.as_path().to_str().unwrap().to_string(),
+                    FileEngineType::Sync,
+                );
+                config.image_format = DiskImageFormat::Qcow2;
+                config.is_read_only = read_only;
+                config.num_queues = num_queues;
+                let result = VirtioBlock::new(config);
+                if !read_only && num_queues == NonZeroU16::new(2) {
+                    assert!(matches!(
+                        result,
+                        Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Qcow2(
+                            block_io::Qcow2IoError::MultiQueueNotSupported
+                        )))
+                    ));
+                } else {
+                    let block = result.unwrap();
+                    assert_eq!(
+                        block.num_queues(),
+                        num_queues.map_or(1, |n| usize::from(n.get()))
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -16,8 +16,12 @@ Discard is currently supported only for writable virtio-block devices using the
 - `Async` IO engine drives;
 - vhost-user block devices.
 
-For regular backing files, Firecracker uses hole punching. For block-device
-backends, Firecracker uses `BLKDISCARD`.
+Raw regular files use hole punching, and raw block devices use `BLKDISCARD`.
+QCOW2 v2/v3 images use format-aware discard. Discarded bytes read back as zero,
+including partial clusters, and referenced internal snapshot data is preserved.
+Physical reclamation is best-effort and depends on filesystem hole-punch support,
+alignment and remaining references. Failed physical releases are retried on later
+format operations and flushes. Interrupted releases may leave allocated space.
 
 ## Discard alignment and drive updates
 

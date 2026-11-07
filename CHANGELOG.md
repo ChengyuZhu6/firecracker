@@ -10,6 +10,12 @@ and this project adheres to
 
 ### Added
 
+- Added developer preview read-only and single-queue writable QCOW2 support for
+  virtio-block. QCOW2 drives require the synchronous IO engine and a
+  self-contained, unencrypted image. The snapshot format version is now
+  `14.0.0`. See [QCOW2 configuration](docs/block.md#qcow2-images). VMDK image
+  support is also marked as developer preview.
+
 - [#6226](https://github.com/firecracker-microvm/firecracker/pull/6226),
   [#6227](https://github.com/firecracker-microvm/firecracker/pull/6227),
   [#6228](https://github.com/firecracker-microvm/firecracker/pull/6228),
@@ -18,6 +24,7 @@ and this project adheres to
   after hot-plugging a device. New configuration options have been added
   (`pcie_hotplug_ports` and a `force` option for `DELETE`). See the
   [Device Hotplugging](docs/device-hotplug.md) documentation page for details.
+
 - [#2046](https://github.com/firecracker-microvm/firecracker/issues/2046): The
   `SendCtrlAltDel` action is now supported on aarch64. It injects a virtual
   power-button press through a new PL061 GPIO controller exposed to the guest as
@@ -25,9 +32,11 @@ and this project adheres to
   previously rejected the action with a 400). The controller's register state is
   saved and restored with the microVM, which bumps the snapshot version to
   `13.0.0`.
+
 - [#6237](https://github.com/firecracker-microvm/firecracker/pull/6237): Added
   balloon and virtio-mem memory reclamation for shared memfd-backed guest
   memory, such as memory shared with vhost-user devices.
+
 - [#6123](https://github.com/firecracker-microvm/firecracker/pull/6123),
   [#6128](https://github.com/firecracker-microvm/firecracker/pull/6128),
   [#6131](https://github.com/firecracker-microvm/firecracker/pull/6131),

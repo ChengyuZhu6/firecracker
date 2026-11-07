@@ -51,6 +51,30 @@
                 "syscall": "fsync"
             },
             {
+                "syscall": "flock",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 5,
+                        "comment": "LOCK_SH | LOCK_NB for read-only QCOW2 images"
+                    }
+                ]
+            },
+            {
+                "syscall": "flock",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 6,
+                        "comment": "LOCK_EX | LOCK_NB for writable QCOW2 images"
+                    }
+                ]
+            },
+            {
                 "syscall": "fallocate",
                 "comment": "Used by the VirtIO block device to punch holes for discard on regular backing files",
                 "args": [
@@ -103,6 +127,10 @@
                 "comment": "Used for drive patching & rescanning, for reading the local timezone from /etc/localtime"
             },
             {
+                "syscall": "fstatfs",
+                "comment": "Used by the writable imago QCOW2 disk image backend"
+            },
+            {
                 "syscall": "ftruncate",
                 "comment": "Used for snapshotting"
             },
@@ -112,7 +140,11 @@
             },
             {
                 "syscall": "preadv",
-                "comment": "Used by the imago VMDK disk image backend"
+                "comment": "Used by the imago disk image backends"
+            },
+            {
+                "syscall": "pwritev",
+                "comment": "Used by the writable imago QCOW2 disk image backend"
             },
             {
                 "syscall": "mremap",
@@ -1570,7 +1602,19 @@
             },
             {
                 "syscall": "preadv",
-                "comment": "Used by imago to read VMDK extents"
+                "comment": "Used by the imago disk image backends"
+            },
+            {
+                "syscall": "pwritev",
+                "comment": "Used by the writable imago QCOW2 disk image backend"
+            },
+            {
+                "syscall": "fstatfs",
+                "comment": "Used to open writable QCOW2 images during drive patch"
+            },
+            {
+                "syscall": "ftruncate",
+                "comment": "Used to grow writable QCOW2 images"
             },
             {
                 "syscall": "epoll_ctl"
@@ -1725,6 +1769,30 @@
             },
             {
                 "syscall": "fsync"
+            },
+            {
+                "syscall": "flock",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 5,
+                        "comment": "LOCK_SH | LOCK_NB for read-only QCOW2 images"
+                    }
+                ]
+            },
+            {
+                "syscall": "flock",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 6,
+                        "comment": "LOCK_EX | LOCK_NB for writable QCOW2 images"
+                    }
+                ]
             },
             {
                 "syscall": "fallocate",

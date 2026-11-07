@@ -3,6 +3,7 @@
 
 """Test that validates that seccompiler filters work as expected"""
 
+import fcntl
 import json
 import platform
 import resource
@@ -17,6 +18,30 @@ ARCH = platform.machine()
 
 FC_FILTER_PATH = Path(f"../resources/seccomp/{ARCH}-unknown-linux-musl.json")
 FILTER_THREADS = list(json.loads(FC_FILTER_PATH.read_text(encoding="ascii")))
+
+
+@pytest.mark.parametrize("arch", ["x86_64", "aarch64"])
+def test_qcow2_syscalls(arch):
+    """Both architectures must allow QCOW2 I/O and drive patching on workers."""
+    path = FC_FILTER_PATH.with_name(f"{arch}-unknown-linux-musl.json")
+    filters = json.loads(path.read_text(encoding="ascii"))
+    for thread in ("vmm", "blk_worker"):
+        thread_filter = filters[thread]
+        assert thread_filter["filter_action"] == "allow"
+        unrestricted = {
+            rule["syscall"] for rule in thread_filter["filter"] if not rule.get("args")
+        }
+        assert {"preadv", "pwritev", "fstatfs", "ftruncate", "fsync"} <= unrestricted
+        assert "flock" not in unrestricted
+        flock_args = [
+            [(arg["index"], arg["type"], arg["op"], arg["val"]) for arg in rule["args"]]
+            for rule in thread_filter["filter"]
+            if rule["syscall"] == "flock"
+        ]
+        assert sorted(flock_args) == [
+            [(1, "dword", "eq", fcntl.LOCK_SH | fcntl.LOCK_NB)],
+            [(1, "dword", "eq", fcntl.LOCK_EX | fcntl.LOCK_NB)],
+        ]
 
 
 @pytest.fixture

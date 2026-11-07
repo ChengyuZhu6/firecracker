@@ -15,6 +15,10 @@ default-members = [
 ]
 resolver = "2"
 
+[patch.crates-io]
+# QCOW2 durability and validation fixes are pending an imago registry release.
+imago = { git = "https://github.com/ChengyuZhu6/imago.git", rev = "0d3800dc9b6ab67060100b5c76988903ea2bd4b0" }
+
 [workspace.lints.rust]
 missing_debug_implementations = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
