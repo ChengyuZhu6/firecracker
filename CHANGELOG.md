@@ -10,6 +10,11 @@ and this project adheres to
 
 ### Added
 
+- Added read-only and single-queue writable QCOW2 support for virtio-block.
+  QCOW2 drives require the synchronous IO engine and a self-contained,
+  unencrypted image. The snapshot format version is now `14.0.0`. See
+  [QCOW2 configuration](docs/block.md#qcow2-images).
+
 - [#6226](https://github.com/firecracker-microvm/firecracker/pull/6226),
   [#6227](https://github.com/firecracker-microvm/firecracker/pull/6227),
   [#6228](https://github.com/firecracker-microvm/firecracker/pull/6228),

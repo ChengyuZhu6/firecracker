@@ -17,11 +17,13 @@ use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::balloon::persist::BalloonConstructorArgs;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::block::persist::BlockConstructorArgs;
+use crate::devices::virtio::block::virtio::device::DiskImageFormat;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceId, VirtioDeviceType};
 use crate::devices::virtio::mem::VirtioMem;
 use crate::devices::virtio::mem::persist::VirtioMemConstructorArgs;
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::net::persist::NetConstructorArgs;
+use crate::devices::virtio::persist::PersistError;
 use crate::devices::virtio::pmem::device::Pmem;
 use crate::devices::virtio::pmem::persist::PmemConstructorArgs;
 use crate::devices::virtio::rng::Entropy;
@@ -210,6 +212,24 @@ impl PciDevices {
         use acpi_tables::Aml;
 
         self.pci_segment().append_aml_bytes(dsdt_data)
+    }
+
+    /// Flush writable QCOW2 data before completing an acknowledged removal.
+    pub(crate) fn prepare_qcow2_unplug(
+        &self,
+        device_id: &VirtioDeviceId,
+    ) -> Result<(), PersistError> {
+        let device = self
+            .get_device(device_id.0, &device_id.1)
+            .expect("device presence should be checked before unplug");
+        let mut device = device.lock().expect("Poisoned lock");
+        if let Some(Block::Virtio(block)) = device.as_mut_any().downcast_mut::<Block>()
+            && block.config.image_format == DiskImageFormat::Qcow2
+            && !block.config.is_read_only
+        {
+            block.prepare_save()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn detach_pci_virtio_device(
@@ -412,16 +432,35 @@ impl<'a> Persist<'a> for PciDevices {
     type Error = DevicePersistError;
 
     fn save(&self) -> Self::State {
+        self.try_save().expect("Failed to save PCI devices")
+    }
+
+    fn try_save(&self) -> Result<Self::State, Self::Error> {
         let mut state = DeviceStates::default();
 
-        for pci_dev in self.virtio_devices.values() {
+        // Finish fallible block preparation before any vsock transport reset is queued.
+        for ((device_type, _), pci_dev) in &self.virtio_devices {
+            if *device_type == VirtioDeviceType::Block {
+                pci_dev
+                    .lock()
+                    .expect("Poisoned lock")
+                    .virtio_device()
+                    .lock()
+                    .expect("Poisoned lock")
+                    .prepare_save()?;
+            }
+        }
+
+        for ((device_type, _), pci_dev) in &self.virtio_devices {
             let locked_pci_dev = pci_dev.lock().expect("Poisoned lock");
             let virtio_dev = locked_pci_dev.virtio_device();
             // We need to call `prepare_save()` on the device before saving the transport
             // so that, if we modify the transport state while preparing the device, e.g. sending
             // an interrupt to the guest, this is correctly captured in the saved transport state.
             let mut locked_virtio_dev = virtio_dev.lock().expect("Poisoned lock");
-            locked_virtio_dev.prepare_save();
+            if *device_type != VirtioDeviceType::Block {
+                locked_virtio_dev.prepare_save()?;
+            }
             let transport_state = locked_pci_dev.state();
 
             match locked_virtio_dev.device_type() {
@@ -546,10 +585,10 @@ impl<'a> Persist<'a> for PciDevices {
             .map(|port| port.lock().expect("Poisoned lock").state())
             .collect();
 
-        PciDevicesState {
+        Ok(PciDevicesState {
             virtio_devices: state,
             root_ports,
-        }
+        })
     }
 
     fn restore(

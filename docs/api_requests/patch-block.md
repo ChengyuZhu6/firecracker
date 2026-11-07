@@ -23,6 +23,11 @@ raw block device is mounted or accessible. Multiqueue follows the same update
 path, but Firecracker updates each queue separately, so in-flight I/O can
 observe a partially updated device.
 
+For QCOW2, PATCH requires a single queue. To change the virtual capacity, use
+a different image file with the new capacity. A PATCH to the current file
+(including another path to the same inode) flushes pending writable data and
+keeps the existing image geometry.
+
 ### Supported use case
 
 This feature was designed to work with a cooperative guest in order to

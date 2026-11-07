@@ -15,6 +15,9 @@ default-members = [
 ]
 resolver = "2"
 
+[patch.crates-io]
+imago = { git = "https://github.com/ChengyuZhu6/imago.git", rev = "d6a40eb5c21e963131a1b439facf252480d5d57e" }
+
 [workspace.lints.rust]
 missing_debug_implementations = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

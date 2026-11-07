@@ -130,6 +130,18 @@ impl Persist<'_> for VirtioBlock {
         if num_queues > 1 && !mq_offered {
             return Err(VirtioBlockError::Persist(PersistError::InvalidInput));
         }
+        if state.disk_image_format == DiskImageFormat::Qcow2 && !is_read_only && num_queues > 1 {
+            return Err(VirtioBlockError::FileEngine(
+                super::io::BlockIoError::Qcow2(super::io::Qcow2IoError::MultiQueueNotSupported),
+            ));
+        }
+        if state.disk_image_format == DiskImageFormat::Qcow2
+            && state.virtio_state.avail_features & (1u64 << VIRTIO_BLK_F_DISCARD) != 0
+        {
+            return Err(VirtioBlockError::FileEngine(
+                super::io::BlockIoError::Qcow2(super::io::Qcow2IoError::DiscardNotSupported),
+            ));
+        }
         let config = VirtioBlockConfig {
             drive_id: state.id.clone(),
             partuuid: state.partuuid.clone(),
@@ -254,6 +266,62 @@ mod tests {
     }
 
     #[test]
+    fn test_qcow2_persistence_num_queues() {
+        use crate::devices::virtio::block::virtio::test_utils::create_test_qcow2;
+
+        let file = create_test_qcow2();
+        for read_only in [false, true] {
+            for num_queues in [None, NonZeroU16::new(1), NonZeroU16::new(2)] {
+                let mut config = default_config(
+                    file.as_path().to_str().unwrap().to_string(),
+                    FileEngineType::Sync,
+                );
+                config.drive_id = "qcow2_persistence".to_string();
+                config.image_format = DiskImageFormat::Qcow2;
+                config.is_read_only = true;
+                config.num_queues = num_queues;
+                let block = VirtioBlock::new(config).unwrap();
+                let mut state = block.save();
+                drop(block);
+                if !read_only {
+                    state.virtio_state.avail_features &= !(1u64 << VIRTIO_BLK_F_RO);
+                }
+                let serialized = bitcode::serialize(&state).unwrap();
+                let restored_state = bitcode::deserialize(&serialized).unwrap();
+                let result = VirtioBlock::restore(
+                    BlockConstructorArgs { mem: default_mem() },
+                    &restored_state,
+                );
+                if !read_only && num_queues == NonZeroU16::new(2) {
+                    assert!(matches!(
+                        result,
+                        Err(VirtioBlockError::FileEngine(
+                            super::io::BlockIoError::Qcow2(
+                                super::io::Qcow2IoError::MultiQueueNotSupported
+                            )
+                        ))
+                    ));
+                } else {
+                    let restored = result.unwrap();
+                    assert_eq!(restored.config().image_format, DiskImageFormat::Qcow2);
+                    assert_eq!(restored.config().is_read_only, read_only);
+                    assert_eq!(restored.config().num_queues, num_queues);
+                    drop(restored);
+                    state.virtio_state.avail_features |= 1u64 << VIRTIO_BLK_F_DISCARD;
+                    assert!(matches!(
+                        VirtioBlock::restore(BlockConstructorArgs { mem: default_mem() }, &state),
+                        Err(VirtioBlockError::FileEngine(
+                            super::io::BlockIoError::Qcow2(
+                                super::io::Qcow2IoError::DiscardNotSupported
+                            )
+                        ))
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_persistence() {
         // We create the backing file here so that it exists for the whole lifetime of the test.
         let f = TempFile::new().unwrap();
@@ -320,7 +388,7 @@ mod tests {
             block.set_acked_features(block.avail_features());
             block.activate(mem.clone(), default_interrupt()).unwrap();
             // Pause the worker for snapshotting
-            block.prepare_save();
+            block.prepare_save().unwrap();
 
             let state = block.save();
             let serialized = bitcode::serialize(&state).unwrap();
@@ -357,7 +425,7 @@ mod tests {
 
             // Unused queues stay idle through the worker and snapshot lifecycle.
             block.kick();
-            block.prepare_save();
+            block.prepare_save().unwrap();
             block.commit_dirty();
 
             let state = block.save();
